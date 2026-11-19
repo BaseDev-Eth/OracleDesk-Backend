@@ -141,6 +141,58 @@ export async function verify(opts: VerifyOptions = {}): Promise<VerifyResult> {
   add('totals_mark', mark.toString() === report.totals.positionsMarkRaw, `${mark.toString()} vs ${report.totals.positionsMarkRaw}`);
   add('totals_nav', nav.toString() === report.totals.navRaw, `${nav.toString()} vs ${report.totals.navRaw}`);
 
+  if (report.schemaVersion >= 2 || report.chain || report.reconciliation) {
+    const intStr = (v: unknown) => typeof v === 'string' && /^-?\d+$/.test(v);
+    const chainOk =
+      report.chain != null &&
+      typeof report.chain === 'object' &&
+      intStr(report.chain.navRaw) &&
+      intStr(report.chain.liquidRaw) &&
+      intStr(report.chain.yieldPrincipalRaw) &&
+      (report.chain.yieldValueShares === null || intStr(report.chain.yieldValueShares)) &&
+      intStr(report.chain.queueReservedRaw) &&
+      intStr(report.chain.netExposureRaw) &&
+      typeof report.chain.ledger === 'number' &&
+      Number.isFinite(report.chain.ledger);
+    add('chain_block', chainOk, chainOk ? `nav=${report.chain.navRaw} ledger=${report.chain.ledger}` : 'missing or malformed chain block');
+
+    const recon = report.reconciliation;
+    const reconShapeOk =
+      recon != null &&
+      typeof recon === 'object' &&
+      intStr(recon.navDiffRaw) &&
+      Array.isArray(recon.perMarket) &&
+      Array.isArray(recon.flags);
+    add('reconciliation_block', reconShapeOk, reconShapeOk ? `markets=${recon.perMarket.length} flags=${recon.flags.length}` : 'missing or malformed reconciliation block');
+
+    if (chainOk && reconShapeOk) {
+      let perMarketOk = true;
+      let recomputedFloorSum = 0n;
+      for (const item of recon.perMarket) {
+        if (!intStr(item?.chainFloorRaw) || !intStr(item?.recomputedFloorRaw) || !intStr(item?.diffRaw)) {
+          perMarketOk = false;
+          break;
+        }
+        const expectedDiff = BigInt(item.chainFloorRaw) - BigInt(item.recomputedFloorRaw);
+        if (expectedDiff.toString() !== item.diffRaw) {
+          perMarketOk = false;
+          break;
+        }
+        recomputedFloorSum += BigInt(item.recomputedFloorRaw);
+      }
+      add('reconciliation_per_market', perMarketOk, `${recon.perMarket.length} markets checked`);
+
+      const recomputedFloorNav =
+        BigInt(report.treasury.usdcBalanceRaw) + recomputedFloorSum - BigInt(report.chain.queueReservedRaw);
+      const expectedNavDiff = BigInt(report.chain.navRaw) - recomputedFloorNav;
+      add(
+        'reconciliation_nav_diff',
+        expectedNavDiff.toString() === recon.navDiffRaw,
+        `${expectedNavDiff.toString()} vs ${recon.navDiffRaw}`,
+      );
+    }
+  }
+
   if (report.previous) {
     try {
       const prevId = BigInt(report.previous.onChainTraceId);

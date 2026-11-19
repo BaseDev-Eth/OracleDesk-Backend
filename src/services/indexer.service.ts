@@ -176,7 +176,19 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         }
       }
     } else if (event.contractName === 'treasury') {
-      if (['TradeAuthorized', 'PositionClosed', 'FeesCollected'].includes(event.eventName)) {
+      if (
+        [
+          'TradeAuthorized',
+          'PositionClosed',
+          'FeesCollected',
+          'Deposited',
+          'Withdrawn',
+          'WithdrawalQueued',
+          'WithdrawalClaimed',
+          'YieldDeposited',
+          'YieldWithdrawn',
+        ].includes(event.eventName)
+      ) {
         await cache.invalidateTag('treasury:capital', event.ledger);
       }
     }

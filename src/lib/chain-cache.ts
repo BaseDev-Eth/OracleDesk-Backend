@@ -145,6 +145,29 @@ export function chainKey(contractId: string, method: string, args: unknown): str
   return `chain:v1:${netHash}:${contractId}:${method}:${argsHash}`;
 }
 
+/**
+ * Single-flight, tag-invalidated cache wrapper for the treasury accounting
+ * snapshot (#299). Invalidated by treasury write hooks and indexer events
+ * tagged with `treasury:capital` (including market-core Trade events where
+ * the trader is the treasury).
+ */
+export async function treasuryAccountingCached<T>(
+  cache: ChainCache,
+  contractId: string,
+  load: () => Promise<{ value: T; ledger: number }>,
+): Promise<CacheEntry<T> & { cached: boolean }> {
+  if (!config.CHAIN_CACHE_ENABLED) {
+    const res = await load();
+    return { ...res, readAt: Date.now(), gen: 0, cached: false };
+  }
+  const key = chainKey(contractId, 'accounting', {});
+  return cache.get(
+    key,
+    { ttlMs: config.ACCOUNTING_CACHE_MS, tags: ['treasury:capital'] },
+    load,
+  );
+}
+
 // ─── Memory Chain Cache ─────────────────────────────────────────────────────
 
 interface StoredMemoryEntry {

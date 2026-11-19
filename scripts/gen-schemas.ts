@@ -9,6 +9,7 @@ export {
   TRACE_V1_SCHEMA,
   QUESTION_V1_SCHEMA,
   QUESTION_V2_SCHEMA,
+  REPORT_V2_SCHEMA,
   SCHEMA_TARGETS,
   jsonSchemaFor,
   generateSchemas,

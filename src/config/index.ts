@@ -577,6 +577,11 @@ export const envObjectSchema = z
     REPORTS_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     REPORT_CRON: z.string().default('10 0 * * *'),
     REPORT_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
+    // Tolerance in 7-decimal base units before a NAV reconciliation diff forces best_effort (#299).
+    REPORT_NAV_TOLERANCE_RAW: z.string().regex(/^\d+$/, 'must be a non-negative integer').default('0'),
+    // On-chain treasury accounting cache TTL and max ledger skew across parallel views (#299).
+    ACCOUNTING_CACHE_MS: z.string().default('15000').transform(Number).pipe(z.number().int().min(100)),
+    ACCOUNTING_MAX_LEDGER_SKEW: z.string().default('1').transform(Number).pipe(z.number().int().min(0)),
 
     // ── Treasury admin console (#156) ─────────────────────────────────────
     // Lifetime of a prepared unsigned transaction.
