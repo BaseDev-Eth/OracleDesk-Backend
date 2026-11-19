@@ -137,3 +137,19 @@ JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/question/v2.json`
 ```
 
 For end-to-end verification of a market's question document, resolution spec commitment (`sha256(XDR(ResolutionSpec))`), creation transaction, and every published reasoning trace, see the **Market provenance** section in [docs/api.md](./api.md) (`GET /api/v1/markets/:id/provenance`).
+
+---
+
+## 6. Registry Governance Verdicts (`trace_verdict`, #306)
+
+Hash integrity (`lastAuditStatus`) and governance trust (`verdict`) are tracked separately on `ReasoningTrace`:
+
+| `verdict.kind` | Meaning | `verified` | Copy-trading |
+|---|---|---|---|
+| `VALID` | Stored hash matches the registry AND the trace is neither flagged nor covered by an agent revocation. | `true` | Allowed |
+| `HASH_MISMATCH` | Submitted hash disagrees with `trace_hash` stored in `reasoning_registry`. | `false` | Refused (`409 TRACE_NOT_TRUSTED`) |
+| `FLAGGED` | Registry admin flagged the trace (`flag_trace`). `verdict.reason` carries the active flag reason; full history is stored in `trace_flag_events`. | `false` | Refused (`409 TRACE_NOT_TRUSTED`) |
+| `AGENT_REVOKED_AFTER` | Publishing agent was revoked (`revoke_agent`) effective at or before the trace's `published_at`. `verdict.effectiveFrom` carries the effective timestamp. | `false` | Refused (`409 TRACE_NOT_TRUSTED`) |
+| `UNKNOWN` | Verdict has not yet been read from `reasoning_registry.trace_verdict`. | `false` | Refused (`409 TRACE_NOT_TRUSTED`) |
+
+`ReasoningTrace.verified` is `true` **only** when `verdict.kind === "VALID"`. Paid trace unlocks still return the trace payload so subscribers can inspect what they paid for alongside the verdict banner data.

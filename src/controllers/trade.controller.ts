@@ -9,6 +9,7 @@ import { config } from '../config';
 import { toDisplayUsdc } from '../lib/amounts';
 import { confirmCopyTradeSchema, copyTradeSchema } from '../validators/trade.validator';
 import { confirmCopyTrade as serviceConfirmCopyTrade } from '../services/copy-trade.service';
+import { getFreshTraceVerdict, TraceVerdictKind } from '../services/trace-audit.service';
 import { AppError } from '../middlewares/error.middleware';
 
 /**
@@ -68,6 +69,19 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
   }
   if (trace.marketId !== marketId) {
     sendError(res, 400, 'MARKET_MISMATCH', 'traceId and marketId do not match');
+    return;
+  }
+
+  // #306: copy-trading moves user money — require a fresh VALID registry verdict.
+  const verdict = await getFreshTraceVerdict(trace as any);
+  if (verdict.kind !== TraceVerdictKind.VALID) {
+    sendError(
+      res,
+      409,
+      'TRACE_NOT_TRUSTED',
+      `Copy-trading is blocked because this trace verdict is ${verdict.kind}`,
+      { verdict },
+    );
     return;
   }
 

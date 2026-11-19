@@ -20,6 +20,7 @@ import { withAdvisoryLocksWait } from '../lib/advisory-lock';
 import { DAY_MS, ledgerCloseDate, utcDayStart } from '../lib/time';
 import { notifyUser } from '../lib/socket-auth';
 import { discoverTracePrice } from './x402-discovery.service';
+import { formatTraceVerdict } from './trace-audit.service';
 
 /** Daily pass price in 7-decimal USDC base units (DAILY_PASS_PRICE_RAW). */
 export const DAILY_PASS_PRICE_RAW = BigInt(config.DAILY_PASS_PRICE_RAW);
@@ -480,9 +481,10 @@ export async function getTracWithAccessControl(
   const audit = trace.lastAuditStatus
     ? { status: trace.lastAuditStatus, checkedAt: trace.lastAuditedAt }
     : null;
+  const verdict = formatTraceVerdict(trace as any);
 
   if (access.hasAccess) {
-    return { ...trace, audit, accessLevel: access.accessType };
+    return { ...trace, audit, verdict, accessLevel: access.accessType };
   }
 
   // Discover live x402 trace price (#63)
@@ -505,6 +507,7 @@ export async function getTracWithAccessControl(
     provenance:          { summary: summarizeProvenance(trace.provenance) },
     verified:            trace.verified,
     audit,
+    verdict,
     ipfsCid:             trace.ipfsCid,
     traceHash:           trace.traceHash,
     contentMode:         trace.contentMode,

@@ -35,13 +35,17 @@ router.get(
       ...(typeof marketId === 'string' && marketId ? { marketId } : {}),
     };
     const [agg, count] = await Promise.all([
-      prisma.reasoningTrace.aggregate({ where, _max: { updatedAt: true } }),
+      (prisma.reasoningTrace.aggregate as any)({
+        where,
+        _max: { updatedAt: true, verdictCheckedAt: true },
+      }),
       prisma.reasoningTrace.count({ where }),
     ]);
     const maxUpdated = agg._max.updatedAt?.toISOString() ?? '0';
+    const maxVerdictChecked = agg._max.verdictCheckedAt?.toISOString() ?? '0';
     const page = req.query.page ?? '1';
     const limit = req.query.limit ?? '20';
-    return `traces:${maxUpdated}:${count}:${page}:${limit}`;
+    return `traces:${maxUpdated}:${maxVerdictChecked}:${count}:${page}:${limit}`;
   }),
   listTraces,
 );
@@ -59,23 +63,38 @@ router.get(
   optionalAuth,
   cachePolicy(async (req) => {
     if (!req.headers.authorization) {
-      const trace = await prisma.reasoningTrace.findUnique({
+      const trace = (await prisma.reasoningTrace.findUnique({
         where: { id: req.params.id },
-        select: { onChainTraceId: true },
-      });
-      if (trace && trace.onChainTraceId !== null) {
+        select: { onChainTraceId: true, verdict: true } as any,
+      })) as { onChainTraceId: bigint | null; verdict?: string } | null;
+      // #306: never serve non-VALID traces from a shared cache for five minutes.
+      if (trace && trace.onChainTraceId !== null && trace.verdict === 'VALID') {
         return { kind: 'shared', maxAge: 300, swr: 0 };
       }
     }
     return { kind: 'personalised', maxAge: 0 };
   }),
   validator(async (req) => {
-    const trace = await prisma.reasoningTrace.findUnique({
+    const trace = (await prisma.reasoningTrace.findUnique({
       where: { id: req.params.id },
-      select: { id: true, updatedAt: true, verified: true, onChainTraceId: true },
-    });
+      select: {
+        id: true,
+        updatedAt: true,
+        verified: true,
+        onChainTraceId: true,
+        verdict: true,
+        verdictVersion: true,
+      } as any,
+    })) as {
+      id: string;
+      updatedAt: Date;
+      verified: boolean;
+      onChainTraceId: bigint | null;
+      verdict?: string;
+      verdictVersion?: number;
+    } | null;
     if (!trace) return null;
-    return `trace:${trace.id}:${trace.updatedAt.toISOString()}:${trace.verified}:${trace.onChainTraceId ?? ''}`;
+    return `trace:${trace.id}:${trace.updatedAt.toISOString()}:${trace.verified}:${trace.onChainTraceId ?? ''}:${trace.verdict ?? 'UNKNOWN'}:${trace.verdictVersion ?? 0}`;
   }),
   getTrace,
 );

@@ -610,13 +610,16 @@ const envSchema = z
     CYCLE_DEADLINE_MS: z.string().default('600000').transform(Number),
     IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
 
-    // ── Trace Audit (Issue #150) ──────────────────────────────────────────
+    // ── Trace Audit (Issue #150, #306) ────────────────────────────────────
     TRACE_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     TRACE_AUDIT_CRON: z.string().default('40 */2 * * *'),
     TRACE_AUDIT_RECHECK_HOURS: z.string().default('168').transform(Number),
     TRACE_AUDIT_MAX_RPC: z.string().default('500').transform(Number),
     TRACE_AUDIT_MAX_FETCHES: z.string().default('100').transform(Number),
     TRACE_AUDIT_MAX_BYTES: z.string().default('2097152').transform(Number),
+    TRACE_AUDIT_VERDICT_RPC_SHARE: z.string().default('0.3').transform(Number).pipe(z.number().gt(0).lte(1)),
+    TRACE_VERDICT_CRON: z.string().default('*/10 * * * *'),
+    TRACE_VERDICT_MAX_RPC: z.string().default('100').transform(Number).pipe(z.number().int().min(1)),
 
     // ── Trace publication queue (Issue #131) ──────────────────────────────
     TRACE_PUBLISH_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
@@ -666,9 +669,10 @@ const envSchema = z
     RECONCILE_INDEXER_LAG_LEDGERS: z.string().default('20').transform(Number)
       .pipe(z.number().int().min(0)),
 
-    // ── Copy Trading (Issue #151) ─────────────────────────────────────────
+    // ── Copy Trading (Issue #151, #306) ───────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
+    COPY_TRADE_VERDICT_MAX_AGE_SECS: z.string().default('300').transform(Number).pipe(z.number().int().min(10).max(86_400)),
 
     // ── Socket.io throttling & slow-consumer guard (Issue #96) ─────────────
     SOCKET_PRICE_TICK_MS: z.string().default('1000').transform(Number),

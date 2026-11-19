@@ -138,6 +138,15 @@ enum TraceAuditStatus {
   ARCHIVED
 }
 
+/// Governance verdict returned by reasoning-registry `trace_verdict` (#306).
+enum TraceVerdictKind {
+  VALID
+  HASH_MISMATCH
+  FLAGGED
+  AGENT_REVOKED_AFTER
+  UNKNOWN
+}
+
 enum AgentType {
   MARKET_MAKER
   TRADER
@@ -457,6 +466,12 @@ model ReasoningTrace {
   previewSources      Json?             // First 2 sources (free preview)
   lastAuditStatus     TraceAuditStatus?
   lastAuditedAt       DateTime?
+  /// Registry governance verdict (#306), separate from hash audit status.
+  verdict              TraceVerdictKind  @default(UNKNOWN)
+  verdictReason        String?           @map("verdict_reason")
+  verdictEffectiveFrom BigInt?           @map("verdict_effective_from")
+  verdictCheckedAt     DateTime?         @map("verdict_checked_at") @db.Timestamptz(3)
+  verdictVersion       Int               @default(0) @map("verdict_version")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
@@ -473,6 +488,8 @@ model ReasoningTrace {
   @@index([traceHash])
   @@index([createdAt])
   @@index([marketId, createdAt])
+  @@index([verdict, verdictCheckedAt])
+  @@index([agentWallet])
   /// Retention (#73) keeps signals cited by a trace: `sourcesUsed @> [{"signalId": …}]`.
   @@index([sourcesUsed(ops: JsonbPathOps)], type: Gin)
   @@map("reasoning_traces")
@@ -1476,4 +1493,30 @@ model PriceResolutionCheck {
 
   @@index([verdict, checkedAt])
   @@map("price_resolution_checks")
+}
+
+/// Full flag/unflag history entries read from reasoning-registry `trace_flags` (#306).
+model TraceFlagEvent {
+  id             String   @id @default(uuid())
+  onChainTraceId BigInt   @map("on_chain_trace_id")
+  active         Boolean
+  reason         String
+  flaggedAt      BigInt   @map("flagged_at")
+  historyIndex   Int      @map("history_index")
+  observedAt     DateTime @default(now()) @map("observed_at") @db.Timestamptz(3)
+
+  @@unique([onChainTraceId, historyIndex])
+  @@index([onChainTraceId])
+  @@map("trace_flag_events")
+}
+
+/// Agents revoked in reasoning-registry (`AgentRevoked`, #306).
+model AgentRevocation {
+  agent          String   @id
+  effectiveFrom  BigInt   @map("effective_from")
+  reason         String
+  observedLedger Int      @map("observed_ledger")
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("agent_revocations")
 }

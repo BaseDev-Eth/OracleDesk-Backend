@@ -612,7 +612,10 @@ The payload's former `llm: { provider, model }` field is replaced by this block.
 #### `GET /traces`
 
 Query: `agentType`, `marketId`, `page`, `limit`. Response: preview traces,
-pagination in `meta`.
+pagination in `meta`. Each item includes `verified` (true **only** when the
+registry governance verdict is `VALID`), `audit: { status, checkedAt } | null`
+(hash integrity), and `verdict: { kind, reason, effectiveFrom, checkedAt }`
+(`VALID | HASH_MISMATCH | FLAGGED | AGENT_REVOKED_AFTER | UNKNOWN`, #306).
 
 #### `GET /traces/:id` (optional auth)
 
@@ -623,8 +626,11 @@ and validated against deployment network and USDC asset rules. If the x402 servi
 is unavailable or requirements fail validation, `unlockPriceStatus` is `"unknown"`,
 `unlockPriceRaw` is `null`, and no fallback price is invented.
 With a daily pass: the full trace and `accessLevel: "DAILY_PASS"`.
-(Previously the route never read the token, so subscribers always got the
-preview. Fixed.)
+Both preview and full responses include `verdict: { kind, reason, effectiveFrom, checkedAt }`
+(paid unlocks continue to show the unlocked content alongside the verdict banner data).
+Anonymous requests receive `public, max-age=300` only when the trace is published
+and `verdict.kind === "VALID"`; non-`VALID` traces use `private, max-age=0, must-revalidate`
+and include `verdict` and `verdictVersion` in the ETag validator.
 
 #### `POST /traces/verify` (auth)
 
@@ -977,7 +983,10 @@ Response:
 
 The direction comes from the trace's edge. The server refuses when there's
 no trace, the edge is zero, the market has no `onChainMarketId`
-(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), or the user has reached the open copy trade
+(`409 MARKET_NOT_ON_CHAIN`, `422 NO_EDGE`), the trace's registry verdict is not
+`VALID` (`409 TRACE_NOT_TRUSTED` with `details.verdict`; re-read live with a
+60 s cache whenever the stored check is older than `COPY_TRADE_VERDICT_MAX_AGE_SECS`),
+or the user has reached the open copy trade
 limit (`429 COPY_TRADE_LIMIT_REACHED` when ≥ `COPY_TRADE_MAX_PENDING` open trades exist).
 Unconfirmed trades expire after `COPY_TRADE_TTL_MINUTES` (default 30).
 `min_shares_out` isn't in the payload because it must come from a quote taken right before signing.
@@ -1704,9 +1713,9 @@ Every endpoint defines an explicit cache policy and strong ETag derivation. Expr
 | `GET /markets/:id` (resolved/cancelled) | `immutable` | `public, max-age=86400, immutable` | `market.updatedAt`, status, counts |
 | `GET /markets/on-chain/:id` | `shared` / `immutable` | same as `GET /markets/:id` | same as `GET /markets/:id` |
 | `GET /markets/on-chain/:id/state` | `shared` | `public, max-age=5, stale-while-revalidate=10` | Canonical body ETag (live simulation) |
-| `GET /traces` | `shared` | `public, max-age=10, stale-while-revalidate=60` | `max(updatedAt)`, count, pagination |
-| `GET /traces/:id` (anon published) | `shared` | `public, max-age=300` | `trace.updatedAt`, verified, onChainTraceId |
-| `GET /traces/:id` (authenticated) | `personalised` | `private, max-age=0, must-revalidate, Vary: Authorization` | `authClass`, `trace.updatedAt` |
+| `GET /traces` | `shared` | `public, max-age=10, stale-while-revalidate=60` | `max(updatedAt)`, `max(verdictCheckedAt)`, count, pagination |
+| `GET /traces/:id` (anon published, `VALID`) | `shared` | `public, max-age=300` | `trace.updatedAt`, `verified`, `onChainTraceId`, `verdict`, `verdictVersion` |
+| `GET /traces/:id` (authenticated or non-`VALID`) | `personalised` | `private, max-age=0, must-revalidate, Vary: Authorization` | `authClass`, `trace.updatedAt`, `verdict`, `verdictVersion` |
 | `GET /portfolio` | `shared` | `public, max-age=15, stale-while-revalidate=60` | Canonical body ETag |
 | `GET /portfolio/positions` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, count |
 | `GET /portfolio/stats` | `shared` | `public, max-age=15, stale-while-revalidate=60` | `max(updatedAt)`, counts |

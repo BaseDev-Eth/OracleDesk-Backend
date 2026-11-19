@@ -21,7 +21,7 @@ import { logger } from '../lib/logger';
 
 export type AlertLevel = 'INFO' | 'WARN' | 'CRITICAL';
 
-export type AlertKind = 'dispute' | 'price_feed' | 'price_verify' | 'fee_budget';
+export type AlertKind = 'dispute' | 'price_feed' | 'price_verify' | 'fee_budget' | 'trace_verdict';
 
 export interface DisputeAlert {
   /** Optional for backwards compatibility with pre-#309 callers; defaults to 'dispute'. */
@@ -80,7 +80,22 @@ export interface FeeBudgetAlert {
   detail?: string;
 }
 
-export type Alert = DisputeAlert | PriceFeedAlert | PriceVerifyAlert | FeeBudgetAlert;
+export interface TraceVerdictAlert {
+  kind: 'trace_verdict';
+  level: AlertLevel;
+  title: string;
+  traceId: string;
+  onChainTraceId: string;
+  agent: string;
+  verdict: string;
+  reason?: string | null;
+  effectiveFrom?: string | null;
+  verdictVersion: number;
+  agentPaused?: boolean;
+  detail?: string;
+}
+
+export type Alert = DisputeAlert | PriceFeedAlert | PriceVerifyAlert | FeeBudgetAlert | TraceVerdictAlert;
 
 export interface AlertSink {
   /** Stable, secret-free identifier; part of the dedupe key. */
@@ -139,6 +154,8 @@ function webhookEventType(alert: Alert): string {
       return 'oracledesk.price_verify_alert';
     case 'fee_budget':
       return 'oracledesk.fee_budget_alert';
+    case 'trace_verdict':
+      return 'oracledesk.trace_verdict_alert';
     case 'dispute':
     default:
       return 'oracledesk.dispute_alert';
@@ -178,6 +195,13 @@ function formatSlackLines(alert: Alert): string[] {
     return [
       `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
       `Class ${alert.opClass} · p95 charged resource ${alert.p95ChargedResource} / budget ${alert.budget} (${Math.round(alert.utilizationRatio * 100)}%)`,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  if (alert.kind === 'trace_verdict') {
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Trace ${alert.onChainTraceId} (${alert.traceId}) · agent ${alert.agent} · verdict ${alert.verdict}${alert.reason ? ` (${alert.reason})` : ''}${alert.agentPaused ? ' · agents paused' : ''}`,
       alert.detail,
     ].filter((line): line is string => Boolean(line));
   }
