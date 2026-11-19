@@ -406,12 +406,21 @@ package's `node_modules` keyed on its lockfile.
 A daily pass is granted only after `payment-verification.service.ts` reads the transaction with Stellar RPC `getTransaction` and confirms all of the following:
 
 - it succeeded;
-- it is a single `transfer` on the USDC contract;
+- it emitted qualifying SAC `transfer` event(s) on the USDC contract;
 - `from` is the logged-in wallet;
 - `to` is `PAYMENTS_RECIPIENT`;
-- the amount is at least `DAILY_PASS_PRICE_RAW`.
+- the net amount (minus refunds) is at least `DAILY_PASS_PRICE_RAW`.
 
 Each hash is usable once (unique `PaymentEvent.txHash`). There is no development bypass; tests inject a fake RPC reader. Per-trace unlocks are sold by the x402 service in the contracts repo, which the frontend calls directly.
+
+### Verify-then-settle and facts caching (#305)
+
+Payment claims (`recordPayment` and `submitPaymentIntent`) run in two strictly separated phases so RPC slowness never pins Postgres connection-pool slots:
+
+1. **Phase A (unlocked):** `getTxFacts(txHash)` fetches immutable transaction facts (`status`, `ledger`, `createdAt`, SAC `transfers`, `txSource`, `memo`, `direct`) outside any database transaction, bounded by `bulkheads['rpc-read']`. When RPC reads are saturated, verification fails fast with `503 UPSTREAM_SATURATED` and a `Retry-After` header rather than queueing on the database pool. Pure `evaluateTransfer(facts, expected)` checks caller expectations without I/O.
+2. **Phase B (locked, DB-only):** `withAdvisoryLocksWait([paymentClaimLockKey(txHash), userPaymentLockKey(userId)], ..., { timeoutMs: CLAIM_LOCKED_TIMEOUT_MS })` (10 s budget) re-checks claim/intent state and runs `settleVerifiedTransfer` (or `PENDING_PAYMENT` / `FAILED` / `REFUND_REQUIRED` transitions) with zero network I/O inside the critical section. If a payment intent's terms changed between Phase A and Phase B, `submitPaymentIntent` restarts once.
+
+**What is cached and why:** finalised transaction facts (`SUCCESS` and `FAILED`) are immutable functions of `txHash`, so `getTxFacts` caches them across three layers: an in-process single-flight map (deduplicating concurrent claims for one hash), a 5,000-entry in-process LRU, and the `chain_tx_facts` Postgres table (written via `INSERT ... ON CONFLICT DO NOTHING` outside any transaction so facts survive restarts, are shared by replicas, and remain readable after Stellar RPC retention expires). Transient or incomplete outcomes (`PAYMENT_NOT_FOUND`, timeouts, `UPSTREAM_SATURATED`, and `CHAIN_READ_INCOMPLETE`) are never cached. `assertNoIoInLock()` in `src/lib/advisory-lock.ts` asserts in tests that `getTransaction` is never called while a payment advisory lock is held.
 
 ## Position valuation (#78)
 

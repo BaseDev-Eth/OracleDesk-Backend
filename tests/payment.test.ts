@@ -460,3 +460,147 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
     verification.setTransactionReader(prev);
   }
 });
+
+test('recordPayment verifies before taking payment advisory locks (assertNoIoInLock) (#305)', async () => {
+  const { verification, CONTRACTS, PAYMENTS_RECIPIENT, config } = await load();
+  const { prisma } = await import('../src/lib/prisma');
+  const { assertNoIoInLock } = await import('../src/lib/advisory-lock');
+  const { recordPayment } = await import('../src/services/subscription.service');
+  const user = Keypair.random().publicKey();
+  const txHash = '12'.repeat(32);
+  const used = new Map<string, { userId: string }>();
+  const subs: any[] = [];
+
+  (prisma.paymentEvent.findUnique as any) = async ({ where }: any) => used.get(where.txHash) ?? null;
+  (prisma.subscription.findFirst as any) = async ({ where }: any) =>
+    subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null;
+  (prisma.spendingAllowance.findUnique as any) = async () => null;
+  (prisma.$transaction as any) = async (fn: any) => fn({
+    $queryRaw: async () => [{ locked: true }],
+    paymentEvent: {
+      findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
+      create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
+    },
+    subscription: {
+      findFirst: async ({ where }: any) => subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null,
+      create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; },
+    },
+    spendingAllowance: { findUnique: async () => null, updateMany: async () => ({ count: 0 }) },
+  });
+
+  const env = transferEnvelope({
+    passphrase: config.STELLAR_NETWORK_PASSPHRASE,
+    contract: CONTRACTS.usdc,
+    from: user,
+    to: PAYMENTS_RECIPIENT,
+    amount: PRICE,
+  });
+  const prev = verification.setTransactionReader(reader({
+    status: rpc.Api.GetTransactionStatus.SUCCESS,
+    envelope: env,
+    events: [transferEvent({ contract: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, amount: PRICE })],
+  }));
+  const unwrapGuard = assertNoIoInLock();
+  try {
+    const sub = await recordPayment({ userId: 'u-lock', walletAddress: user, type: 'DAILY_PASS', txHash });
+    assert.equal(sub.status, 'ACTIVE');
+  } finally {
+    unwrapGuard();
+    verification.setTransactionReader(prev);
+  }
+});
+
+test('getTxFacts caches SUCCESS and FAILED with single-flight, and never caches NOT_FOUND or incomplete meta (#305)', async () => {
+  const { verification, CONTRACTS, PAYMENTS_RECIPIENT, config } = await load();
+  const user = Keypair.random().publicKey();
+  const env = transferEnvelope({
+    passphrase: config.STELLAR_NETWORK_PASSPHRASE,
+    contract: CONTRACTS.usdc,
+    from: user,
+    to: PAYMENTS_RECIPIENT,
+    amount: PRICE,
+  });
+
+  let rpcCalls = 0;
+  const dbMap = new Map<string, any>();
+  const prevStore = verification.setTxFactsStoreForTest({
+    async read(h) { return dbMap.get(h) ?? null; },
+    async write(f) { dbMap.set(f.txHash, f); },
+  });
+
+  const hSuccess = '34'.repeat(32);
+  const hNotFound = '56'.repeat(32);
+  const hFailed = '78'.repeat(32);
+  const hIncomplete = '9a'.repeat(32);
+
+  const prevReader = verification.setTransactionReader({
+    async getTransaction(hash: string) {
+      rpcCalls++;
+      await new Promise((r) => setTimeout(r, 10));
+      if (hash === hNotFound) {
+        return { status: rpc.Api.GetTransactionStatus.NOT_FOUND, txHash: hash } as any;
+      }
+      if (hash === hFailed) {
+        return { status: rpc.Api.GetTransactionStatus.FAILED, txHash: hash, ledger: 50, createdAt: 1700000100 } as any;
+      }
+      if (hash === hIncomplete) {
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, txHash: hash, ledger: 51 } as any;
+      }
+      return {
+        status: rpc.Api.GetTransactionStatus.SUCCESS,
+        txHash: hash,
+        ledger: 49,
+        createdAt: 1700000000,
+        envelopeXdr: env,
+        resultMetaXdr: metaV3([transferEvent({ contract: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, amount: PRICE })]),
+      } as any;
+    },
+  });
+
+  try {
+    // Concurrent calls for the same hash share a single RPC request.
+    const [f1, f2] = await Promise.all([verification.getTxFacts(hSuccess), verification.getTxFacts(hSuccess)]);
+    assert.equal(rpcCalls, 1);
+    assert.equal(f1.status, 'SUCCESS');
+    assert.equal(f2.ledger, 49);
+    assert.ok(dbMap.has(hSuccess));
+
+    // Subsequent lookup hits LRU without calling RPC.
+    await verification.getTxFacts(hSuccess);
+    assert.equal(rpcCalls, 1);
+
+    // Clear LRU -> hits DB store without calling RPC.
+    verification.clearTxFactsCache();
+    const fromDb = await verification.getTxFacts(hSuccess);
+    assert.equal(rpcCalls, 1);
+    assert.equal(fromDb.transfers[0].amount, PRICE);
+
+    // FAILED is cached (and evaluateTransfer maps it to PAYMENT_FAILED).
+    const failedFacts = await verification.getTxFacts(hFailed);
+    assert.equal(failedFacts.status, 'FAILED');
+    assert.equal(rpcCalls, 2);
+    await verification.getTxFacts(hFailed);
+    assert.equal(rpcCalls, 2);
+    assert.throws(
+      () => verification.evaluateTransfer(failedFacts, {
+        txHash: hFailed, token: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, minAmount: PRICE,
+      }),
+      (err: any) => err.code === 'PAYMENT_FAILED',
+    );
+
+    // NOT_FOUND is never cached.
+    assert.equal(await code(verification.getTxFacts(hNotFound)), 'PAYMENT_NOT_FOUND');
+    assert.equal(await code(verification.getTxFacts(hNotFound)), 'PAYMENT_NOT_FOUND');
+    assert.equal(rpcCalls, 4);
+    assert.equal(dbMap.has(hNotFound), false);
+
+    // CHAIN_READ_INCOMPLETE is never cached.
+    assert.equal(await code(verification.getTxFacts(hIncomplete)), 'CHAIN_READ_INCOMPLETE');
+    assert.equal(await code(verification.getTxFacts(hIncomplete)), 'CHAIN_READ_INCOMPLETE');
+    assert.equal(rpcCalls, 6);
+    assert.equal(dbMap.has(hIncomplete), false);
+  } finally {
+    verification.setTransactionReader(prevReader);
+    verification.setTxFactsStoreForTest(prevStore);
+  }
+});

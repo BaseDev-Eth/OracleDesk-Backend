@@ -210,3 +210,26 @@ export function acceptInboundId(value: string | undefined): string | undefined {
   if (!config.TRUST_INBOUND_REQUEST_ID || !value) return undefined;
   return INBOUND_ID.test(value) ? value : undefined;
 }
+
+// ─── Active Advisory Lock Tracking (#305) ───────────────────────────────────
+
+const activeLockAls = new AsyncLocalStorage<readonly string[]>();
+
+/** Runs `fn` with the currently held advisory-lock keys recorded in ALS. */
+export function withActiveLockContext<T>(keys: readonly string[], fn: () => T): T {
+  const existing = activeLockAls.getStore();
+  const merged = existing ? [...existing, ...keys] : [...keys];
+  return activeLockAls.run(merged, fn);
+}
+
+/** Advisory-lock keys held by the current async execution, if any. */
+export function activeLockKeys(): readonly string[] | undefined {
+  return activeLockAls.getStore();
+}
+
+/** True when the current async execution holds a payment advisory lock (`payment:*`). */
+export function isInPaymentLock(): boolean {
+  const keys = activeLockAls.getStore();
+  if (!keys) return false;
+  return keys.some((k) => k.startsWith('payment:'));
+}

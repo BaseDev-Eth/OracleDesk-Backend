@@ -108,5 +108,13 @@
     ],
     "reason": "limitPriceBps is bounded to 1..10000 by its CHECK and decisionLedger is a Stellar ledger sequence (u32); both match Prisma Int fields.",
     "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261119070000_chain_tx_facts",
+    "rules": [
+      "prefer-bigint-over-int"
+    ],
+    "reason": "ledger is a Stellar ledger sequence (u32) matching the Prisma Int field and existing payment_events.ledger column.",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
   }
 ]

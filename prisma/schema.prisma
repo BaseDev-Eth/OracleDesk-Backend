@@ -1642,3 +1642,17 @@ model RecalibrationMapRow {
   @@index([agentType, category, active])
   @@map("recalibration_maps")
 }
+
+/// Cached immutable chain facts for finalised transactions (#305).
+/// Written outside any transaction via INSERT ... ON CONFLICT DO NOTHING so
+/// payment verification can run before taking advisory locks and survive
+/// restarts and RPC retention windows.
+model ChainTxFact {
+  txHash    String   @id
+  status    String
+  ledger    Int
+  facts     Json
+  fetchedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@map("chain_tx_facts")
+}
