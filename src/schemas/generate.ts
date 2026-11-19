@@ -82,6 +82,11 @@ export const TRACE_V1_SCHEMA = {
         },
       },
     },
+    citedSourceIds: {
+      type: 'array',
+      maxItems: 50,
+      items: { type: 'string' },
+    },
     betFraction: { type: ['number', 'null'] },
     betSizeUsdc: { type: ['number', 'null'] },
     hedgeConditions: {

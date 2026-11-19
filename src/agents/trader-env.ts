@@ -242,27 +242,43 @@ export function prodTraderEnv(): TraderEnv {
           return Array.isArray(detail?.provenance) ? (detail!.provenance as ProvenanceEntry[]) : [];
         });
 
+      const citedSourceIds = [
+        ...new Set(
+          (order.forecast.ensemble?.members ?? []).flatMap((m) => {
+            const detail = m.detail as { citedSignalIds?: unknown } | undefined;
+            return Array.isArray(detail?.citedSignalIds)
+              ? (detail!.citedSignalIds.filter((x): x is string => typeof x === 'string'))
+              : [];
+          }),
+        ),
+      ];
+
       // Generate reasoning trace BEFORE executing
-      const { trace, tracePayload } = await generateReasoningTrace({
-        marketId:            order.marketId,
-        agentType:           'TRADER',
-        decisionType:        'OPEN_POSITION',
-        sourcesUsed:         order.forecast.sources,
-        probabilityEstimate: order.forecast.p,
-        rawProbabilityEstimate: order.forecast.ensemble?.raw?.p ?? order.forecast.p,
-        marketProbability:   order.marketProb,
-        edge:                order.edge,
-        confidenceInterval:  order.forecast.ci,
-        forecast:            order.forecast.ensemble as unknown as Record<string, unknown> | undefined,
-        betFraction:         order.kelly,
-        betSizeUsdc:         order.amount,
-        sizing:              order.sizing as unknown as Record<string, unknown>,
-        correlation: {
-          pairs:      order.correlation.correlatedPairs,
-          method:     order.correlation.method ?? 'matrix',
-          snapshotId: order.correlation.snapshotId ?? null,
+      const { trace, tracePayload } = await generateReasoningTrace(
+        {
+          marketId:               order.marketId,
+          agentType:              'TRADER',
+          decisionType:           'OPEN_POSITION',
+          sourcesUsed:            order.forecast.sources,
+          ...(citedSourceIds.length > 0 ? { citedSourceIds } : {}),
+          probabilityEstimate:    order.forecast.p,
+          rawProbabilityEstimate: order.forecast.ensemble?.raw?.p ?? order.forecast.p,
+          marketProbability:      order.marketProb,
+          edge:                   order.edge,
+          confidenceInterval:     order.forecast.ci,
+          forecast:               order.forecast.ensemble as unknown as Record<string, unknown> | undefined,
+          betFraction:            order.kelly,
+          betSizeUsdc:            order.amount,
+          sizing:                 order.sizing as unknown as Record<string, unknown>,
+          correlation: {
+            pairs:      order.correlation.correlatedPairs,
+            method:     order.correlation.method ?? 'matrix',
+            snapshotId: order.correlation.snapshotId ?? null,
+          },
         },
-      }, { upstreamProvenance: forecastProvenance });
+        undefined,
+        { upstreamProvenance: forecastProvenance },
+      );
 
       // Execute trade (Never abort between chain write and DB update)
       await executeTrade({

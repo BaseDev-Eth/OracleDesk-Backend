@@ -105,7 +105,7 @@ export interface ForecastInput {
   resolutionSource: string | null;
   /** The pinned question document, only after its hash verified; fields whitelisted. */
   questionDoc: Record<string, unknown> | null;
-  signals: Array<{ id?: string; source: string; title: string; publishedAt: string }>;
+  signals: Array<{ id?: string; source: string; title: string; publishedAt: string; url?: string | null }>;
   now: Date;
 }
 
@@ -159,8 +159,8 @@ export interface TradePayload {
   amount: number;
   /** Collateral in base units (#76). Submitted as-is, never re-derived from `amount`. */
   amountRaw?: bigint;
-  /** Treasury budget snapshot the size was clamped against, logged on a cap rejection (#76). */
-  budget?: Record<string, string>;
+  /** Treasury budget snapshot the size was clamped against, logged on a cap rejection (#76, #299). */
+  budget?: Record<string, string | string[]>;
   price: number;
   kellyFraction: number;
   edgeDetected: number;
@@ -192,6 +192,8 @@ export interface TraceInput {
   agentType: AgentType;
   decisionType: string;
   sourcesUsed: WeightedSignal[];
+  /** Signal-store ids explicitly cited and validated in the forecast (#304). */
+  citedSourceIds?: string[];
   probabilityEstimate: number;
   /** The forecaster's probability before recalibration (#244). Defaults to probabilityEstimate. */
   rawProbabilityEstimate?: number;

@@ -36,7 +36,10 @@
     },
     "agentType": {
       "type": "string",
-      "enum": ["MARKET_MAKER", "TRADER"]
+      "enum": [
+        "MARKET_MAKER",
+        "TRADER"
+      ]
     },
     "decisionType": {
       "type": "string",
@@ -51,15 +54,21 @@
     "market": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["backendId", "onChainId"],
+      "required": [
+        "backendId",
+        "onChainId"
+      ],
       "properties": {
         "backendId": {
           "type": "string",
           "format": "uuid"
         },
         "onChainId": {
-          "type": ["string", "null"],
-          "pattern": "^[0-9]+$"
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^\\d+$"
         }
       }
     },
@@ -80,9 +89,11 @@
     },
     "confidenceInterval": {
       "type": "object",
-      "description": "lower must be <= upper",
       "additionalProperties": false,
-      "required": ["lower", "upper"],
+      "required": [
+        "lower",
+        "upper"
+      ],
       "properties": {
         "lower": {
           "type": "number"
@@ -98,7 +109,12 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["source", "weight", "signal", "rawValue"],
+        "required": [
+          "source",
+          "weight",
+          "signal",
+          "rawValue"
+        ],
         "properties": {
           "source": {
             "type": "string"
@@ -112,27 +128,45 @@
             "type": "string"
           },
           "rawValue": {
-            "type": ["number", "null"]
+            "type": [
+              "number",
+              "null"
+            ]
           }
         }
       }
     },
+    "citedSourceIds": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "string"
+      }
+    },
     "betFraction": {
-      "type": ["number", "null"]
+      "type": [
+        "number",
+        "null"
+      ]
     },
     "betSizeUsdc": {
-      "type": ["number", "null"]
+      "type": [
+        "number",
+        "null"
+      ]
     },
     "hedgeConditions": {
       "type": "array",
-      "maxItems": 20,
       "items": {
         "type": "string",
         "maxLength": 500
       }
     },
     "agentWallet": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "createdAt": {
       "type": "string",

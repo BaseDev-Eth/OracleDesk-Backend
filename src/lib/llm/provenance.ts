@@ -27,6 +27,14 @@ export type ErrorClass =
   | 'server_error'
   | 'error';
 
+/** Citation-validation counts attached to LLM/default provenance (#304); counts only, never text. */
+export interface CitationCheckProvenance {
+  version: 1;
+  checked: number;
+  issueCodes: Record<string, number>;
+  action: 'ACCEPTED' | 'STRIPPED' | 'REJECTED';
+}
+
 /** A model produced the output. */
 export interface LlmProvenance {
   source: 'llm';
@@ -46,6 +54,8 @@ export interface LlmProvenance {
   fallbackFrom?: { provider: 'anthropic' | 'gemini'; model: string; errorClass: ErrorClass };
   /** sha256 of the raw model output (canonical JSON of a tool input). */
   outputSha256: string;
+  /** Output citation validation summary (#304). */
+  citationCheck?: CitationCheckProvenance;
 }
 
 /** No model produced the output: a hard-coded safe default was used. */
@@ -53,7 +63,9 @@ export interface DefaultProvenance {
   source: 'default';
   promptId: string;
   promptVersion: number;
-  reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED';
+  reason: 'LLM_FAILED' | 'LLM_BUDGET_EXCEEDED' | 'CITATION_REJECTED';
+  /** Output citation validation summary when rejected (#304). */
+  citationCheck?: CitationCheckProvenance;
 }
 
 export type ProvenanceEntry = LlmProvenance | DefaultProvenance;

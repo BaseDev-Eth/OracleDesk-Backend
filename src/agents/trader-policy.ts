@@ -66,7 +66,7 @@ export interface SizingRecord {
   finalRaw: string;
   binding: SizingBinding;
   safetyBps: number;
-  budget: Record<string, string>;
+  budget: Record<string, string | string[]>;
   /** Ledger view the decision was made against (#266). */
   priceAsOf: PriceAsOf;
 }

@@ -151,3 +151,21 @@ sized on (after recalibration when applied). The database also stores
 `rawProbabilityEstimate` per trace; it is not part of the pinned document.
 Readers must treat all three fields as optional: traces written before #244
 do not have them.
+
+## Citation validation fields (#304)
+
+To distinguish signals provided to the model (`sourcesUsed`) from signals the
+model actually cited and passed output-side citation validation, traces may
+carry the following optional, backwards-compatible fields (old traces without
+them remain valid):
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `citedSourceIds` | `string[]` (optional) | Deduplicated signal-store ids that were cited in accepted forecast adjustments/rationale and verified against the rendered input set. |
+| `provenance.llm[].citationCheck` | `{ version: 1, checked: number, issueCodes: Record<string, number>, action: "ACCEPTED" \| "STRIPPED" \| "REJECTED" }` (optional) | Aggregate counts and deterministic remediation action from the citation validator (counts only, never raw model or signal text). |
+| `forecast.members[].detail.citedSignalIds` | `string[]` (optional) | Accepted cited signal-store ids for the published LLM forecast sample. |
+| `forecast.members[].detail.rejectedAdjustments` | `Array<{ signal_id, delta, why, reasons }>` (optional) | Invalid adjustments stripped for `UNKNOWN_ID` or `QUARANTINED_ID`. |
+
+When all hedge conditions fail citation validation, the trace falls back to
+default hedge conditions with `provenance.llm[]` recording
+`{ source: "default", reason: "CITATION_REJECTED", citationCheck }`.

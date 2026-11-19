@@ -8,6 +8,7 @@
  */
 import type { PromptDef } from './define';
 import { forecastV1 } from './forecast.v1';
+import { forecastV2 } from './forecast.v2';
 import { hedgeConditionsV1 } from './hedge-conditions.v1';
 import { marketProposalV1 } from './market-proposal.v1';
 
@@ -16,15 +17,15 @@ export { definePrompt } from './define';
 export type { MarketProposalVars } from './market-proposal.v1';
 export type { HedgeConditionsVars } from './hedge-conditions.v1';
 export type { ForecastVars } from './forecast.v1';
-export { forecastV1, hedgeConditionsV1, marketProposalV1 };
+export { forecastV1, forecastV2, hedgeConditionsV1, marketProposalV1 };
 
-const ALL: ReadonlyArray<PromptDef<any>> = [marketProposalV1, hedgeConditionsV1, forecastV1];
+const ALL: ReadonlyArray<PromptDef<any>> = [marketProposalV1, hedgeConditionsV1, forecastV1, forecastV2];
 
 /** Current version per id. Bump when a new version file is added. */
 export const CURRENT_VERSION: Readonly<Record<string, number>> = {
   'market-proposal': 1,
   'hedge-conditions': 1,
-  forecast: 1,
+  forecast: 2,
 };
 
 export function listPrompts(): Array<{ id: string; version: number; contentHash: string }> {

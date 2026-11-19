@@ -665,6 +665,10 @@ export const envObjectSchema = z
     ),
     IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
 
+    // ── Forecast & Citation Validation (#75, #304) ────────────────────────
+    CITATION_QUOTE_MIN_JACCARD: z.string().default('0.5').transform(Number).pipe(z.number().min(0).max(1)),
+    CITATION_MAX_INVALID_FRACTION: z.string().default('0.34').transform(Number).pipe(z.number().min(0).max(1)),
+
     // ── Trace Audit (Issue #150) ──────────────────────────────────────────
     TRACE_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     TRACE_AUDIT_CRON: z.string().default('40 */2 * * *'),
