@@ -22,6 +22,7 @@ import {
   getTreasury,
   getTreasuryOperation,
   getDisputes,
+  getPriceMarketsHealth,
   listReconciliationRuns,
   listTreasuryOperations,
   recordTreasuryOperation,
@@ -69,6 +70,8 @@ router.get('/reconciliation/runs/:id', requirePermission('reconciliation.run'), 
 router.post('/reconciliation/run', requirePermission('reconciliation.run'), triggerReconciliationRun);
 // Spec compatibility report from the boot gate (#34): read-only diagnostics.
 router.get('/chain/spec-compat', requirePermission('admin.read'), getSpecCompat);
+// Price-mode market Reflector feed health & post-resolution verification (#309).
+router.get('/price-markets/health', requirePermission('admin.read'), getPriceMarketsHealth);
 router.get('/treasury', getTreasury);
 router.get('/treasury/operations', listTreasuryOperations);
 router.post('/treasury/operations', createOperation);

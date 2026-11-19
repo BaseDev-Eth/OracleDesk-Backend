@@ -83,5 +83,14 @@
     ],
     "reason": "chain_transactions has had no writers since #38 shipped (the write path was never wired to it), so the table is empty in every deployment: the enum conversion rewrites nothing, the dropped NOT NULLs affect no rows (BUILT rows legitimately precede a hash/envelope), and the index builds on an empty table. CREATE INDEX CONCURRENTLY cannot run inside Prisma's migration transaction; lock_timeout = 5s bounds any wait.",
     "approvedBy": "pending maintainer review on the PR that adds this migration"
+  },
+  {
+    "migration": "20261020000000_price_market_monitoring",
+    "rules": [
+      "ban-drop-not-null",
+      "require-concurrent-index-creation"
+    ],
+    "reason": "alert_deliveries is a low-volume operational table; dropping NOT NULL on reviewId enables non-dispute alerts keyed by subjectId without breaking existing readers. price_feed_checks, price_close_snapshots and price_resolution_checks are new empty tables; CREATE INDEX CONCURRENTLY cannot run inside Prisma's migration transaction and lock_timeout = 5s bounds any lock wait.",
+    "approvedBy": "pending maintainer review on the PR that adds this migration"
   }
 ]

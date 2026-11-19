@@ -69,3 +69,32 @@ DIGEST=<sha256> ./scripts/post-deploy-checks.sh
 ```
 
 Checks are read-only. `SKIP_KUBE=1` omits the digest check in local tests.
+
+## Price-market feed health & post-resolution verification (#309)
+
+Open Reflector price-mode markets are checked every 15 minutes (and every 5
+minutes within `PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS` of close) using fresh
+SEP-40 reads (`assets()`, `decimals()`, `resolution()`, `lastprice()`, and
+recent `price(asset, ts)` grid slots) evaluated against the **latest ledger
+close time**. Inspect status via `GET /api/v1/admin/price-markets/health`.
+
+### Guardian actions by open-market severity
+
+| Severity | Triggers | Recommended guardian action |
+|---|---|---|
+| `OK` | Asset supported, decimals & resolution unchanged, age ≤ `maxStaleness / 2`, zero grid gaps. | No action required. |
+| `WARN` | `FEED_AGING` (`ageSecs > maxStaleness / 2`), `FEED_STALE` / `NO_DATA` outside the close window, `GRID_GAPS` in the last `PRICE_FEED_GAP_SLOTS` slots, or `RESOLUTION_CHANGED`. | Monitor the Reflector feed status and upstream oracle announcements; confirm whether updates resume before the close window. Pause new price-market creation if the feed is degraded. |
+| `CRITICAL` | `FEED_UNSUPPORTED` (asset removed from `assets()`), `DECIMALS_CHANGED` (committed fixed-point threshold no longer matches the intended price), or `STALE_NEAR_CLOSE` / `NO_DATA_NEAR_CLOSE` within `PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS` of close. | **Act before finality**: `resolve_price` finalises immediately with no dispute window, and `guardian_void_market` rejects a `Finalized` market. Verify the feed on-chain and, if the market cannot settle safely, invoke `guardian_void_market` from `RESOLVER_GUARDIAN_ADDRESS` before close/resolution. |
+
+### Post-resolution verification verdicts
+
+On every indexed `PriceResolution` event, the backend verifies the settled
+outcome against the committed spec and the close-time snapshot (`price_close_snapshots`):
+
+| Verdict | Meaning | Action |
+|---|---|---|
+| `CONSISTENT` | Event outcome matches `expectedOutcome(price, threshold, direction)`, event price/timestamp match the close snapshot, and no outcome-flipping outlier was detected. | Record audited; no action required. |
+| `UNVERIFIABLE` | No close snapshot was captured and feed history aged out on-chain. | Check why `captureCloseSnapshot` did not record before feed retention expired; verify RPC availability. |
+| `OUTCOME_MISMATCH` | Spec hash mismatch or `expectedOutcome` disagrees with the on-chain event outcome (**CRITICAL**). | Treat as a severe resolver/spec incident. Pause agents (`POST /api/v1/admin/agents/ALL/pause`) and investigate contract/spec state immediately. |
+| `PRICE_MISMATCH` | Event price or timestamp differs from the Reflector record at `close_time` (**CRITICAL**). | Audit the transaction XDR and Reflector storage history; verify no retroactive feed mutation or resolver misconfiguration occurred. |
+| `OUTLIER` | Event price deviated from the median of neighbouring grid records by > `PRICE_VERIFY_OUTLIER_BPS` **and** the threshold lies between the event price and the median (flipping the outcome) (**CRITICAL**). | Inspect the `detail` payload (`deviationFromMedianBps`, `distanceToThresholdBps`, `medianPrice`), audit the Reflector oracle feed, and consider removing the feed from `REFLECTOR_FEEDS_JSON`. |

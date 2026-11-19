@@ -1292,6 +1292,57 @@ wallet. The backend never signs or sends it.
 | 422 | `SIMULATION_FAILED` | `details.contractError` names the resolver error. |
 | 503 | `GUARDIAN_NOT_CONFIGURED` | `RESOLVER_GUARDIAN_ADDRESS` is not set. |
 
+#### `GET /admin/price-markets/health` (auth, `admin.read`)
+Returns Reflector feed health for every open price-mode market (`ACTIVE` / `RESOLVING`) and post-resolution verification verdicts for closed price-mode markets (#309):
+
+```json
+{
+  "open": [
+    {
+      "marketId": "uuid",
+      "onChainMarketId": "12",
+      "question": "Will the Reflector BTC/USD price be at or above 100,000 at 2026-11-01T00:00:00Z?",
+      "status": "ACTIVE",
+      "expiryTimestamp": "2026-11-01T00:00:00.000Z",
+      "secsToClose": 3400,
+      "latestCheck": {
+        "checkedAt": "2026-10-31T23:03:20.000Z",
+        "ledger": 5123456,
+        "severity": "WARN",
+        "health": {
+          "marketId": "uuid",
+          "supported": true,
+          "lastTs": "1793487300",
+          "ageSecs": 500,
+          "decimalsNow": 14,
+          "decimalsChanged": false,
+          "resolutionNow": 300,
+          "resolutionChanged": false,
+          "gapSlots": 1,
+          "severity": "WARN",
+          "reasons": ["FEED_AGING", "GRID_GAPS"]
+        }
+      }
+    }
+  ],
+  "closed": [
+    {
+      "marketId": "uuid",
+      "onChainMarketId": "11",
+      "status": "RESOLVED",
+      "resolvedOutcome": true,
+      "snapshotCaptured": true,
+      "verification": {
+        "eventId": "0005123000-0000000000",
+        "verdict": "CONSISTENT",
+        "detail": { "distanceToThresholdBps": 240, "deviationFromMedianBps": 12 },
+        "checkedAt": "2026-10-31T00:05:10.000Z"
+      }
+    }
+  ]
+}
+```
+
 ### Treasury admin console (auth, admin)
 
 The backend never holds the treasury admin key. It prepares unsigned,

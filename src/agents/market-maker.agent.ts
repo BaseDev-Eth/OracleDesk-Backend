@@ -113,7 +113,7 @@ export async function runMarketMakerCycle(
       return null;
     }
     proposal = prepared.proposal;
-    const resolutionDetails = prepared.resolution;
+    let resolutionDetails: Record<string, unknown> | null = prepared.resolution ? { ...prepared.resolution } : null;
 
     signal.throwIfAborted();
 
@@ -140,6 +140,12 @@ export async function runMarketMakerCycle(
       if (plan.spec && plan.question) {
         marketSpec = plan.spec;
         proposal = { ...proposal, market_question: plan.question };
+        if (plan.resolution) {
+          resolutionDetails = {
+            ...(resolutionDetails ?? {}),
+            price: plan.resolution,
+          };
+        }
       }
     }
 
@@ -190,7 +196,7 @@ export async function runMarketMakerCycle(
       ...proposal,
       initial_yes_probability: decision.pAdj,
       minimum_liquidity_usdc:  toDisplayUsdc(decision.seedRaw),
-    }, proposalProvenance, resolutionDetails);
+    }, proposalProvenance, resolutionDetails as any);
     const market = await prisma.market.update({ where: { id: created.id }, data: { seedPolicy: seedPolicy as object } });
     logger.info({ marketId: market.id, category: market.category }, 'Market Maker Agent: market created in DB');
 

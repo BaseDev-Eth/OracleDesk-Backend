@@ -43,6 +43,7 @@ import {
   buildGuardianTx,
   listDisputes,
 } from '../services/dispute-monitor.service';
+import { getPriceMarketsHealthOverview } from '../services/price-feed-monitor.service';
 import {
   addSignature,
   cancelOperation,
@@ -433,4 +434,9 @@ export async function cancelDisputeTx(req: Request, res: Response): Promise<void
 /** POST /admin/disputes/:id/void-tx — unsigned guardian_void_market. */
 export async function voidDisputeTx(req: Request, res: Response): Promise<void> {
   sendSuccess(res, await buildGuardianTx(disputeId(req), 'guardian_void_market'));
+}
+
+/** GET /admin/price-markets/health — Reflector feed health & post-resolution verdicts (#309). */
+export async function getPriceMarketsHealth(_req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await getPriceMarketsHealthOverview());
 }

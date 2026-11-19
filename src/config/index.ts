@@ -360,6 +360,10 @@ const envSchema = z
     // escalating with an ERROR AgentLog for a guardian to void the market.
     PRICE_RESOLUTION_MAX_WAIT_SECS: z.string().default('86400').transform(Number).pipe(z.number().int().min(60)),
     PRICE_RESOLUTION_POLL_MS: z.string().default('300000').transform(Number).pipe(z.number().int().min(1000)),
+    // Reflector feed monitor & post-resolution verifier (#309)
+    PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS: z.string().default('7200').transform(Number).pipe(z.number().int().min(60)),
+    PRICE_FEED_GAP_SLOTS: z.string().default('6').transform(Number).pipe(z.number().int().min(1).max(100)),
+    PRICE_VERIFY_OUTLIER_BPS: z.string().default('500').transform(Number).pipe(z.number().int().min(1).max(100_000)),
 
     // Failure breaker (#79): this many chain-write failures inside the window
     // pause the writing agent until an operator resumes it.

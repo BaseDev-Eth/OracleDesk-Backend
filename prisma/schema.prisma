@@ -1395,14 +1395,16 @@ model DisputeReview {
   @@map("dispute_reviews")
 }
 
-/// One alert sent (or attempted) for a review, deduplicated by `dedupeKey`.
+/// One alert sent (or attempted) for a subject, deduplicated by `dedupeKey`.
 model AlertDelivery {
   id        String    @id @default(uuid())
-  reviewId  String
+  reviewId  String?
+  /// Dedupe subject id (reviewId for disputes, or e.g. price_feed:<marketId>:<severity>, price_verify:<marketId>).
+  subjectId String?
   /// INFO | WARN | CRITICAL
   level     String
   sink      String
-  /// reviewId:level:sink
+  /// subjectId:level:sink (reviewId:level:sink for dispute alerts)
   dedupeKey String    @unique
   /// SENT | FAILED
   status    String
@@ -1411,5 +1413,50 @@ model AlertDelivery {
   error     String?
 
   @@index([reviewId])
+  @@index([subjectId])
   @@map("alert_deliveries")
+}
+
+/// Periodic Reflector feed health checks for open price-mode markets (#309).
+/// Stores the latest check per market plus severity transitions.
+model PriceFeedCheck {
+  id        String   @id @default(uuid())
+  marketId  String   @map("market_id")
+  checkedAt DateTime @default(now()) @map("checked_at") @db.Timestamptz(3)
+  ledger    Int
+  health    Json
+  /// OK | WARN | CRITICAL
+  severity  String
+
+  @@index([marketId, checkedAt])
+  @@index([severity, checkedAt])
+  @@map("price_feed_checks")
+}
+
+/// Reflector close-time price and neighbouring grid records captured at close (#309).
+/// First successful read wins so post-resolution verification survives feed history expiry.
+model PriceCloseSnapshot {
+  id        String   @id @default(uuid())
+  marketId  String   @unique @map("market_id")
+  closeTime BigInt   @map("close_time")
+  /// Array of { requestedTs, price, timestamp } starting with closeTime followed by k prior grid slots.
+  records   Json
+  ledger    Int
+  readAt    DateTime @default(now()) @map("read_at") @db.Timestamptz(3)
+
+  @@map("price_close_snapshots")
+}
+
+/// Independent post-resolution verification verdict for a PriceResolution event (#309).
+model PriceResolutionCheck {
+  id        String   @id @default(uuid())
+  marketId  String   @unique @map("market_id")
+  eventId   String   @map("event_id")
+  /// CONSISTENT | OUTCOME_MISMATCH | PRICE_MISMATCH | OUTLIER | UNVERIFIABLE
+  verdict   String
+  detail    Json
+  checkedAt DateTime @default(now()) @map("checked_at") @db.Timestamptz(3)
+
+  @@index([verdict, checkedAt])
+  @@map("price_resolution_checks")
 }

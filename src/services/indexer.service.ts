@@ -233,6 +233,13 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
     return;
   }
 
+  // #309: verify price-mode resolutions independently after the poll tick.
+  if (event.contractName === 'resolver' && event.eventName === 'PriceResolution') {
+    const verifier = await import('./price-resolution-verifier.service');
+    verifier.schedulePriceVerification(event.id);
+    return;
+  }
+
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
     const traceHash =
       typeof p.trace_hash === 'string'
