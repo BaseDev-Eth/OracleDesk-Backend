@@ -39,6 +39,7 @@ import {
   type RetryOptions,
 } from './stellar/failures';
 import { withTimeout, TimeoutError, sleep } from '../lib/resilience';
+import { withCallerClass } from '../lib/context';
 import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Outcome, Position } from '../generated/market-core';
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
@@ -268,21 +269,23 @@ async function write<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const seenVersion = await assertAgentActive(scope);
-  try {
-    const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
-    const result = viaAgentAccount
-      ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
-      : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
-    await recordChainWriteOutcome(scope, true, null);
-    return result;
-  } catch (err) {
-    // A refused write never reached the chain; it is not a chain failure.
-    if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
-      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
+  return withCallerClass('critical', async () => {
+    const seenVersion = await assertAgentActive(scope);
+    try {
+      const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
+      const result = viaAgentAccount
+        ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
+        : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
+      await recordChainWriteOutcome(scope, true, null);
+      return result;
+    } catch (err) {
+      // A refused write never reached the chain; it is not a chain failure.
+      if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
+        await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
+      }
+      throw err;
     }
-    throw err;
-  }
+  });
 }
 
 type WriteContract = 'treasury' | 'reasoningRegistry' | 'resolver';
@@ -299,36 +302,37 @@ async function submitWrite<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const oracle = getFeeOracle();
-  const policy = oracle.getPolicies()[opClass];
-  const inclusionFee = await oracle.pickInclusionFee(opClass);
-  const timeoutInSeconds = timeoutFor(opClass);
+  return withCallerClass('critical', async () => {
+    const oracle = getFeeOracle();
+    const policy = oracle.getPolicies()[opClass];
+    const inclusionFee = await oracle.pickInclusionFee(opClass);
+    const timeoutInSeconds = timeoutFor(opClass);
 
-  let leasedChannel: LeasedChannel | null = null;
-  let signer: Signer | undefined = undefined;
+    let leasedChannel: LeasedChannel | null = null;
+    let signer: Signer | undefined = undefined;
 
-  if (config.CHAIN_EXECUTION_MODE === 'live') {
-    const pool = getChannelPool();
-    if (pool.size > 0) {
-      leasedChannel = await pool.acquire();
-      const agentKeypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
-      signer = channelSigner(leasedChannel.channel.keypair, agentKeypair);
+    if (config.CHAIN_EXECUTION_MODE === 'live') {
+      const pool = getChannelPool();
+      if (pool.size > 0) {
+        leasedChannel = await pool.acquire();
+        const agentKeypair = Keypair.fromSecret(config.AGENT_SECRET_KEY);
+        signer = channelSigner(leasedChannel.channel.keypair, agentKeypair);
+      }
     }
-  }
 
-  try {
-    let tx: AssembledTransaction<unknown>;
     try {
-      tx = await call({ fee: inclusionFee, timeoutInSeconds }, signer);
-    } catch (err) {
-      // A bounded trade's local limit/deadline check (#245) refused to build:
-      // nothing was sent, and the caller needs the original decision code.
-      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
-      throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
-        method,
-        cause: err instanceof Error ? err.message : String(err),
-      });
-    }
+      let tx: AssembledTransaction<unknown>;
+      try {
+        tx = await withTimeout('rpc-read', () => call({ fee: inclusionFee, timeoutInSeconds }, signer), { signal });
+      } catch (err) {
+        // A bounded trade's local limit/deadline check (#245) refused to build:
+        // nothing was sent, and the caller needs the original decision code.
+        if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
+        throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
+          method,
+          cause: err instanceof Error ? err.message : String(err),
+        });
+      }
     const simulated = simulatedValue<T>(contract, method, tx);
 
     // A pause that landed while the transaction was being built stops here.
@@ -399,7 +403,7 @@ async function submitWrite<T>(
 
       // Re-simulate after signing auth entries (#37)
       if (typeof (tx as any).simulate === 'function') {
-        await (tx as any).simulate();
+        await withTimeout('rpc-read', () => (tx as any).simulate(), { signal });
       }
     }
 
@@ -547,6 +551,7 @@ async function submitWrite<T>(
       await leasedChannel.release();
     }
   }
+  });
 }
 
 /** Retry loop for live writes (#40): only provably-not-applied failures retry. */
@@ -561,40 +566,42 @@ async function liveWriteWithRetry<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  const opts = retryOptions();
-  const startedAt = Date.now();
-  let attempt = 0;
-  for (;;) {
-    try {
-      return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
-    } catch (err) {
-      if (err instanceof AgentPausedError) throw err;
-      if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
-      // Expiry has its own recovery (#42) and a pending submission belongs to
-      // the outbox worker (#35): neither is retried blindly here.
-      if (err instanceof ExpiredError) throw err;
-      if (err instanceof ChainPendingError) throw err;
-      const failure: ClassifiedFailure =
-        err instanceof ChainWriteFailure ? err.failure : classifyFailure({ contract, err });
-      const { retry, delayMs } = retryDecision(failure, attempt, opts, Date.now() - startedAt);
-      if (!retry) {
-        throw new TransactionError(`${method} failed (${failure.class})`, failure, attempt + 1);
+  return withCallerClass('critical', async () => {
+    const opts = retryOptions();
+    const startedAt = Date.now();
+    let attempt = 0;
+    for (;;) {
+      try {
+        return await attemptWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
+      } catch (err) {
+        if (err instanceof AgentPausedError) throw err;
+        if ((err as { name?: string } | null)?.name === 'TradeBoundError') throw err;
+        // Expiry has its own recovery (#42) and a pending submission belongs to
+        // the outbox worker (#35): neither is retried blindly here.
+        if (err instanceof ExpiredError) throw err;
+        if (err instanceof ChainPendingError) throw err;
+        const failure: ClassifiedFailure =
+          err instanceof ChainWriteFailure ? err.failure : classifyFailure({ contract, err });
+        const { retry, delayMs } = retryDecision(failure, attempt, opts, Date.now() - startedAt);
+        if (!retry) {
+          throw new TransactionError(`${method} failed (${failure.class})`, failure, attempt + 1);
+        }
+        logger.warn(
+          {
+            method,
+            failureClass: failure.class,
+            txCode: failure.txCode,
+            opCode: failure.opCode,
+            attempt: attempt + 1,
+            delayMs,
+          },
+          'chain write retrying',
+        );
+        await sleep(delayMs, signal);
+        attempt++;
       }
-      logger.warn(
-        {
-          method,
-          failureClass: failure.class,
-          txCode: failure.txCode,
-          opCode: failure.opCode,
-          attempt: attempt + 1,
-          delayMs,
-        },
-        'chain write retrying',
-      );
-      await sleep(delayMs, signal);
-      attempt++;
     }
-  }
+  });
 }
 
 async function attemptWrite<T>(
@@ -627,7 +634,7 @@ async function attemptWrite<T>(
       async (ctx) => {
         let tx: AssembledTransaction<unknown>;
         try {
-          tx = await call({ fee: inclusionFee, timeoutInSeconds });
+          tx = await withTimeout('rpc-read', () => call({ fee: inclusionFee, timeoutInSeconds }), { signal });
         } catch (err) {
           throw new ChainError(`${method} could not be built`, contractErrorName(contract, err), {
             method,
@@ -924,7 +931,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
 
     let txStatusRes: any;
     try {
-      txStatusRes = await reader.getTransaction(finalHash);
+      txStatusRes = await withTimeout('rpc-confirm', () => reader.getTransaction(finalHash), { signal: c.signal });
     } catch (err: any) {
       logger.warn({ err: err?.message, txHash: finalHash }, 'getTransaction poll error; retrying');
     }

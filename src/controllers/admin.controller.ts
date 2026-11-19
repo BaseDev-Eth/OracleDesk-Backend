@@ -26,6 +26,7 @@ import { agentSigner } from '../services/stellar/clients';
 import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
 import { getFeeOracle } from '../services/stellar/fees';
 import { getLlmUsage } from '../lib/llm-budget';
+import { getBulkheadStats } from '../lib/resilience';
 import { getCronStatus } from '../cron/registry';
 import { AppError } from '../middlewares/error.middleware';
 import {
@@ -266,6 +267,7 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       // Shared across instances (Redis); null when the guard store is down.
       usage: await getLlmUsage().catch(() => null),
     },
+    bulkheads: getBulkheadStats(),
     process: {
       uptimeSeconds: process.uptime(),
       memory: process.memoryUsage(),

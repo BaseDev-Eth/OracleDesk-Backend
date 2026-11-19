@@ -3,6 +3,8 @@ import type Redis from 'ioredis';
 import { config } from '../config';
 import { logger } from './logger';
 import { ChainError } from '../services/stellar/errors';
+import { currentCallerClass, isHigherCallerClass, type CallerClass } from './context';
+import { withLoadTracker, type LoadTracker } from './resilience';
 
 export interface CacheEntry<T> {
   value: T;
@@ -18,7 +20,88 @@ export interface ChainCache {
     load: () => Promise<{ value: T; ledger: number }>,
   ): Promise<CacheEntry<T> & { cached: boolean }>;
   invalidateTag(tag: string, atLedger?: number): Promise<void>;
-  stats(): { hits: number; misses: number; coalesced: number; staleRejects: number };
+  stats(): { hits: number; misses: number; coalesced: number; staleRejects: number; promoted: number };
+}
+
+interface InFlightEntry<T = any> {
+  callerClass: CallerClass;
+  tracker: LoadTracker;
+  promise: Promise<CacheEntry<T> & { cached: boolean }>;
+  settled: boolean;
+  pendingCount: number;
+  lastError: unknown;
+  resolve: (val: CacheEntry<T> & { cached: boolean }) => void;
+  reject: (err: unknown) => void;
+}
+
+function runSingleFlight<T>(
+  inFlight: Map<string, InFlightEntry>,
+  key: string,
+  execute: () => Promise<CacheEntry<T> & { cached: boolean }>,
+  counters: { onCoalesced: () => void; onPromoted: () => void },
+): Promise<CacheEntry<T> & { cached: boolean }> {
+  const callerClass = currentCallerClass();
+  const existing = inFlight.get(key) as InFlightEntry<T> | undefined;
+
+  const attachAttempt = (entry: InFlightEntry<T>, tracker: LoadTracker) => {
+    entry.pendingCount++;
+    const run = withLoadTracker(tracker, execute);
+    run.then(
+      (val) => {
+        if (!entry.settled) {
+          entry.settled = true;
+          if (inFlight.get(key) === entry) inFlight.delete(key);
+          entry.resolve(val);
+        }
+      },
+      (err) => {
+        entry.lastError = err;
+      },
+    ).finally(() => {
+      entry.pendingCount--;
+      if (!entry.settled && entry.pendingCount === 0) {
+        entry.settled = true;
+        if (inFlight.get(key) === entry) inFlight.delete(key);
+        entry.reject(entry.lastError);
+      }
+    });
+  };
+
+  if (existing) {
+    const lowPriorityOrigin = existing.callerClass === 'public' || existing.callerClass === 'background';
+    if (lowPriorityOrigin && !existing.tracker.started && isHigherCallerClass(callerClass, existing.callerClass)) {
+      counters.onPromoted();
+      const promotedTracker: LoadTracker = { started: false };
+      existing.callerClass = callerClass;
+      existing.tracker = promotedTracker;
+      attachAttempt(existing, promotedTracker);
+      return existing.promise;
+    }
+    counters.onCoalesced();
+    return existing.promise;
+  }
+
+  let resolveFn!: (val: CacheEntry<T> & { cached: boolean }) => void;
+  let rejectFn!: (err: unknown) => void;
+  const promise = new Promise<CacheEntry<T> & { cached: boolean }>((resolve, reject) => {
+    resolveFn = resolve;
+    rejectFn = reject;
+  });
+
+  const tracker: LoadTracker = { started: false };
+  const entry: InFlightEntry<T> = {
+    callerClass,
+    tracker,
+    promise,
+    settled: false,
+    pendingCount: 0,
+    lastError: undefined,
+    resolve: resolveFn,
+    reject: rejectFn,
+  };
+  inFlight.set(key, entry);
+  attachAttempt(entry, tracker);
+  return promise;
 }
 
 // ─── Codec ──────────────────────────────────────────────────────────────────
@@ -78,12 +161,13 @@ export function memoryChainCache(): ChainCache {
   const entries = new Map<string, StoredMemoryEntry>();
   const tagGens = new Map<string, number>();
   const minLedgers = new Map<string, number>();
-  const inFlight = new Map<string, Promise<any>>();
+  const inFlight = new Map<string, InFlightEntry>();
 
   let hits = 0;
   let misses = 0;
   let coalesced = 0;
   let staleRejects = 0;
+  let promoted = 0;
 
   return {
     async invalidateTag(tag: string, atLedger?: number): Promise<void> {
@@ -98,11 +182,6 @@ export function memoryChainCache(): ChainCache {
       opts: { ttlMs: number; tags: string[] },
       load: () => Promise<{ value: T; ledger: number }>,
     ): Promise<CacheEntry<T> & { cached: boolean }> {
-      if (inFlight.has(key)) {
-        coalesced++;
-        return inFlight.get(key)!;
-      }
-
       const execute = async (): Promise<CacheEntry<T> & { cached: boolean }> => {
         const now = Date.now();
         const stored = entries.get(key);
@@ -204,13 +283,18 @@ export function memoryChainCache(): ChainCache {
         }
       };
 
-      const promise = execute().finally(() => inFlight.delete(key));
-      inFlight.set(key, promise);
-      return promise;
+      return runSingleFlight(inFlight, key, execute, {
+        onCoalesced: () => {
+          coalesced++;
+        },
+        onPromoted: () => {
+          promoted++;
+        },
+      });
     },
 
     stats() {
-      return { hits, misses, coalesced, staleRejects };
+      return { hits, misses, coalesced, staleRejects, promoted };
     },
   };
 }
@@ -221,12 +305,13 @@ let lastRedisCacheLog = 0;
 
 export function redisChainCache(redis: Redis): ChainCache {
   const fallback = memoryChainCache();
-  const inFlight = new Map<string, Promise<any>>();
+  const inFlight = new Map<string, InFlightEntry>();
 
   let hits = 0;
   let misses = 0;
   let coalesced = 0;
   let staleRejects = 0;
+  let promoted = 0;
 
   return {
     async invalidateTag(tag: string, atLedger?: number): Promise<void> {
@@ -247,11 +332,6 @@ export function redisChainCache(redis: Redis): ChainCache {
       opts: { ttlMs: number; tags: string[] },
       load: () => Promise<{ value: T; ledger: number }>,
     ): Promise<CacheEntry<T> & { cached: boolean }> {
-      if (inFlight.has(key)) {
-        coalesced++;
-        return inFlight.get(key)!;
-      }
-
       const execute = async (): Promise<CacheEntry<T> & { cached: boolean }> => {
         let rawCache: string | null = null;
         try {
@@ -434,13 +514,18 @@ export function redisChainCache(redis: Redis): ChainCache {
         }
       };
 
-      const promise = execute().finally(() => inFlight.delete(key));
-      inFlight.set(key, promise);
-      return promise;
+      return runSingleFlight(inFlight, key, execute, {
+        onCoalesced: () => {
+          coalesced++;
+        },
+        onPromoted: () => {
+          promoted++;
+        },
+      });
     },
 
     stats() {
-      return { hits, misses, coalesced, staleRejects };
+      return { hits, misses, coalesced, staleRejects, promoted };
     },
   };
 }

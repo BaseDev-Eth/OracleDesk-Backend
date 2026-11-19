@@ -28,6 +28,8 @@ import { config } from '../../config';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { getRedis } from '../../lib/redis';
+import { withCallerClass } from '../../lib/context';
+import { withTimeout } from '../../lib/resilience';
 import { readClients, rpcServer } from './clients';
 import { contractErrorName } from './errors';
 import { FeeBumpCapExceeded, buildFeeBump, innerInclusionPerOp, planBump } from './fee-bump';
@@ -396,7 +398,9 @@ export async function recoverRow(
   const hashes = [row.hash, ...(row.feeBumpHashes ?? [])];
   let landed: { hash: string; status: 'SUCCESS' | 'FAILED'; resp: rpc.Api.GetTransactionResponse } | null = null;
   for (const hash of hashes) {
-    const resp = await server.getTransaction(hash);
+    const resp = await withCallerClass('agent', () =>
+      withTimeout('rpc-confirm', () => server.getTransaction(hash)),
+    );
     if (resp.status === 'SUCCESS' || resp.status === 'FAILED') {
       landed = { hash, status: resp.status, resp };
       break;
@@ -446,7 +450,9 @@ export async function recoverRow(
   if (row.status === 'SIGNED' && row.envelopeXdr) {
     try {
       const signed = TransactionBuilder.fromXDR(row.envelopeXdr, config.STELLAR_NETWORK_PASSPHRASE) as Transaction;
-      const resp = await server.sendTransaction(signed);
+      const resp = await withCallerClass('agent', () =>
+        withTimeout('rpc-write', () => server.sendTransaction(signed)),
+      );
       if (resp.status === 'PENDING' || resp.status === 'DUPLICATE') {
         await store.transition(row.id, ['SIGNED'], 'SUBMITTED', { submitLedger: resp.latestLedger ?? null });
         stats.resubmitted++;
@@ -467,7 +473,9 @@ export async function recoverRow(
 
   // Submitted but not yet visible: fee-bump when stuck past the threshold (#38).
   if (!config.FEE_BUMP_ENABLED) return stats;
-  const latestLedger = deps.ledgerOverride ?? (await server.getLatestLedger()).sequence;
+  const latestLedger =
+    deps.ledgerOverride ??
+    (await withCallerClass('agent', () => withTimeout('rpc-read', () => server.getLatestLedger()))).sequence;
   if (!shouldBump(row, latestLedger, nowSecs, {
     afterLedgers: config.FEE_BUMP_AFTER_LEDGERS,
     maxAttempts: config.FEE_BUMP_MAX_ATTEMPTS,
@@ -483,37 +491,39 @@ export async function recoverRow(
  * for terminal rows a crash left unhandled, and fee-bump stuck submissions.
  */
 export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryStats> {
-  const store = deps.store ?? prismaOutboxStore();
-  const stats: RecoveryStats = { resolved: 0, resubmitted: 0, expired: 0, handled: 0, bumped: 0 };
-  const now = deps.now ? new Date(deps.now() * 1000) : new Date();
+  return withCallerClass('agent', async () => {
+    const store = deps.store ?? prismaOutboxStore();
+    const stats: RecoveryStats = { resolved: 0, resubmitted: 0, expired: 0, handled: 0, bumped: 0 };
+    const now = deps.now ? new Date(deps.now() * 1000) : new Date();
 
-  // Crash between a terminal transition and its handler: run the handler now.
-  for (const row of await store.findUnhandled()) {
-    try {
-      await runCompletionHandler(
-        row,
-        {
-          status: row.status as 'SUCCESS' | 'FAILED' | 'EXPIRED',
-          value: row.status === 'SUCCESS' ? row.returnValue : undefined,
-          txHash: row.landedHash ?? row.hash,
-          error: row.error,
-        },
-        store,
-      );
-      stats.handled++;
-    } catch (err) {
-      logger.error({ err, outboxId: row.id, kind: row.kind }, 'outbox: completion handler failed; will retry');
+    // Crash between a terminal transition and its handler: run the handler now.
+    for (const row of await store.findUnhandled()) {
+      try {
+        await runCompletionHandler(
+          row,
+          {
+            status: row.status as 'SUCCESS' | 'FAILED' | 'EXPIRED',
+            value: row.status === 'SUCCESS' ? row.returnValue : undefined,
+            txHash: row.landedHash ?? row.hash,
+            error: row.error,
+          },
+          store,
+        );
+        stats.handled++;
+      } catch (err) {
+        logger.error({ err, outboxId: row.id, kind: row.kind }, 'outbox: completion handler failed; will retry');
+      }
     }
-  }
 
-  for (const row of await store.findInFlight(now, deps.signedGraceMs ?? SIGNED_GRACE_MS)) {
-    try {
-      await recoverRow(row, { ...deps, store }, stats);
-    } catch (err) {
-      logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id }, 'outbox: recovery of one row failed; next pass retries');
+    for (const row of await store.findInFlight(now, deps.signedGraceMs ?? SIGNED_GRACE_MS)) {
+      try {
+        await recoverRow(row, { ...deps, store }, stats);
+      } catch (err) {
+        logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id }, 'outbox: recovery of one row failed; next pass retries');
+      }
     }
-  }
-  return stats;
+    return stats;
+  });
 }
 
 /**
@@ -521,10 +531,12 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
  * so a matching non-terminal row resolves without waiting for the poll.
  */
 export async function recoverByTxHash(txHash: string, deps: RecoverDeps = {}): Promise<void> {
-  const store = deps.store ?? prismaOutboxStore();
-  const row = await store.findByAnyHash([txHash]);
-  if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
-  await recoverRow(row, { ...deps, store });
+  return withCallerClass('agent', async () => {
+    const store = deps.store ?? prismaOutboxStore();
+    const row = await store.findByAnyHash([txHash]);
+    if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
+    await recoverRow(row, { ...deps, store });
+  });
 }
 
 async function bumpRow(
@@ -571,10 +583,14 @@ async function bumpRow(
 
   // Persisted before sending, as for every submission.
   try {
-    const resp = await server.sendTransaction(outer);
+    const resp = await withCallerClass('agent', () =>
+      withTimeout('rpc-write', () => server.sendTransaction(outer)),
+    );
     if (resp.status === 'ERROR') {
       // Expected after the inner already landed; poll before deciding.
-      const recheck = await server.getTransaction(row.hash!);
+      const recheck = await withCallerClass('agent', () =>
+        withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
+      );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
         const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {
           landedHash: row.hash,

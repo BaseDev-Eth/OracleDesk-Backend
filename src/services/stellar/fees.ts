@@ -2,6 +2,7 @@ import { rpc } from '@stellar/stellar-sdk';
 import { config } from '../../config';
 import { logger } from '../../lib/logger';
 import { rpcServer } from './clients';
+import { withTimeout } from '../../lib/resilience';
 
 export type OperationClass = 'market_create' | 'trade' | 'trace_publish' | 'maintenance';
 
@@ -158,7 +159,7 @@ export class FeeOracle {
 
     this.inFlightPromise = (async () => {
       try {
-        const stats = await this.feeStatsSource.getFeeStats();
+        const stats = await withTimeout('rpc-read', () => this.feeStatsSource.getFeeStats());
         this.lastStats = stats;
         this.lastFetchedAt = Date.now();
         return stats;

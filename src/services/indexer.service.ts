@@ -25,7 +25,7 @@ import { config } from '../config';
 import { CONTRACTS } from '../config/contracts';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
-import { newId, runWithContext } from '../lib/context';
+import { newId, runWithContext, withCallerClass } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { disabledEventProjections } from './stellar/spec-compat';
 import { printable } from './chain.service';
@@ -405,16 +405,21 @@ async function writeCursor(lastLedger: number): Promise<void> {
  * Indexes from `fromLedger` (default: the stored cursor + 1, or the oldest
  * ledger RPC retains) up to the latest ledger. Returns counts.
  */
+const LIVE_TAIL_MAX_LAG_LEDGERS = 20;
+
 export async function backfillEvents(
   fromLedger?: number,
   deps: IndexerDeps = { source: rpcServer, emit: () => undefined },
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; liveTail?: boolean },
 ): Promise<{ startLedger: number; lastLedger: number; seen: number; stored: number }> {
   const tickLimitMs = Math.floor(config.CYCLE_DEADLINE_MS / 10);
   const handle = deadline('rpc-events', opts?.signal, tickLimitMs);
 
   try {
-    const health = await withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal });
+    const initialClass = opts?.liveTail && fromLedger === undefined ? 'agent' : 'background';
+    const health = await withCallerClass(initialClass, () =>
+      withTimeout('rpc-events', async () => deps.source.getHealth(), { signal: handle.signal }),
+    );
     const cursor = await readCursor();
     let startLedger = fromLedger ?? (cursor !== null ? cursor + 1 : health.oldestLedger);
 
@@ -429,15 +434,24 @@ export async function backfillEvents(
       return { startLedger, lastLedger: cursor ?? health.latestLedger, seen: 0, stored: 0 };
     }
 
+    // Catch-up runs as background; live tail runs as agent to protect freshness (#300).
+    const isLiveTail =
+      Boolean(opts?.liveTail) &&
+      fromLedger === undefined &&
+      health.latestLedger - startLedger <= LIVE_TAIL_MAX_LAG_LEDGERS;
+    const eventsClass = isLiveTail ? 'agent' : 'background';
+
     const known = specs();
     const filters: rpc.Api.EventFilter[] = [{ type: 'contract', contractIds: [...known.keys()] }];
     let seen = 0;
     let stored = 0;
     let latestLedger = health.latestLedger;
-    let page = await withTimeout(
-      'rpc-events',
-      async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
-      { signal: handle.signal },
+    let page = await withCallerClass(eventsClass, () =>
+      withTimeout(
+        'rpc-events',
+        async () => deps.source.getEvents({ startLedger, filters, limit: PAGE_LIMIT }),
+        { signal: handle.signal },
+      ),
     );
 
     for (;;) {
@@ -475,10 +489,12 @@ export async function backfillEvents(
         }
       }
       if (page.events.length < PAGE_LIMIT) break;
-      page = await withTimeout(
-        'rpc-events',
-        async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
-        { signal: handle.signal },
+      page = await withCallerClass(eventsClass, () =>
+        withTimeout(
+          'rpc-events',
+          async () => deps.source.getEvents({ filters, cursor: page.cursor, limit: PAGE_LIMIT }),
+          { signal: handle.signal },
+        ),
       );
     }
 
@@ -547,16 +563,27 @@ export function startEventListener(emit: IndexerDeps['emit']): () => void {
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
   const tick = async () => {
-    try {
-      const result = await backfillEvents(undefined, { source: rpcServer, emit });
-      pollState.lastLedger = result.lastLedger;
-      pollState.updatedAt = new Date().toISOString();
-      pollState.lastPollError = null;
-    } catch (err) {
-      pollState.lastPollError = err instanceof Error ? err.message : String(err);
-      logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
-    }
-    pollState.lastPollAt = new Date().toISOString();
+    const isLiveTail = pollState.lastLedger !== null;
+    await runWithContext(
+      {
+        requestId: newId('cyc'),
+        kind: 'indexer',
+        job: 'indexer-poll',
+        callerClass: isLiveTail ? 'agent' : 'background',
+      },
+      async () => {
+        try {
+          const result = await backfillEvents(undefined, { source: rpcServer, emit }, { liveTail: isLiveTail });
+          pollState.lastLedger = result.lastLedger;
+          pollState.updatedAt = new Date().toISOString();
+          pollState.lastPollError = null;
+        } catch (err) {
+          pollState.lastPollError = err instanceof Error ? err.message : String(err);
+          logger.warn({ err: err instanceof Error ? err.message : err }, 'Indexer poll failed; will retry');
+        }
+        pollState.lastPollAt = new Date().toISOString();
+      },
+    );
     if (!stopped) timer = setTimeout(tick, config.INDEXER_POLL_MS);
   };
   void tick();

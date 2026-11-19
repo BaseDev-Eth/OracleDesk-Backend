@@ -1092,6 +1092,26 @@ Simulations of live contract state (`get_market`, `state`, `available_capital`) 
 - **Lossless Codec:** Typed tagged representations preserve `bigint`, `Buffer`/`Uint8Array`, and tagged enum variants across round-trips.
 - **Tag Generation Invalidation:** Invalidation avoids key scans by incrementing generation counters (`chain:gen:<tag>`). Each cached entry records its tags' generations at read time.
 - **Ledger Invalidation & Single-Flight:** Invalidation tracks `chain:minLedger:<tag>`, ensuring simulation results read from older ledgers are never written back over fresher events. Cross-instance single-flight locks prevent stampeding RPC nodes during concurrent cache misses.
+- **Priority-inversion protection (#300):** Each in-flight entry tracks the originating caller class and whether its load has entered a bulkhead slot. When a higher class joins a `public` or `background` load that is still queued, a promoted load starts at the higher class and resolves both waiters with whichever finishes first (`stats().promoted`).
+
+## RPC caller classes (#300)
+
+Outbound RPC traffic is partitioned across `rpc-read`, `rpc-write`, `rpc-confirm`, and `rpc-events` bulkheads (`src/lib/resilience.ts`). Caller classes flow through `AsyncLocalStorage` (`src/lib/context.ts`, `withCallerClass` / `currentCallerClass`):
+
+| Class | Scope | `rpc-read` defaults (`BULKHEAD_RPC_READ=16`) |
+|---|---|---|
+| `critical` | Agent writes (`write`, `submitWrite`, `liveWriteWithRetry`), their write-path simulations, and inline `confirmSubmitted` polling. `withCallerClass` never lowers an active `critical` context. | `weight: 8`, `reserved: 4`, `maxQueue: BULKHEAD_QUEUE`, `maxWaitMs: 15000` |
+| `agent` | Agent cycles (`runTraderCycle`, `runMarketMakerCycle`), outbox recovery passes (`recoverInFlight`, `recoverByTxHash`), and indexer live-tail ticks. | `weight: 4`, `reserved: 3`, `maxQueue: 24`, `maxWaitMs: 15000` |
+| `interactive` | Authenticated HTTP requests (`req.user` or `Authorization` header), including payment and copy-trade verification. | `weight: 3`, `reserved: 2`, `maxQueue: 16`, `maxWaitMs: 10000` |
+| `public` | Anonymous HTTP requests. | `weight: 2`, `reserved: 0`, `maxQueue: 8`, `maxWaitMs: 5000` |
+| `background` | Reconciler, trace audits, crons, indexer catch-up, and backfills. | `weight: 1`, `reserved: 0`, `maxQueue: 8`, `maxWaitMs: 30000` |
+
+`rpc-write` (`BULKHEAD_RPC_WRITE=4`) and `rpc-confirm` (`BULKHEAD_RPC_CONFIRM=8`, `TIMEOUT_RPC_CONFIRM_MS=8000`) reserve most slots for `critical` (and `agent` on `rpc-confirm`).
+
+- **Admission & Dequeue:** A class may enter immediately when under its own reservation or when `active < maxConcurrent - Σ remaining_reserved(other classes)`. Queued work dequeues via deficit round robin by weight across non-empty admissible class queues (FIFO within each class).
+- **Shedding order:** On arrival, a class whose queue is full or whose estimated wait exceeds `maxWaitMs` (never applied to `critical` from lower-class pressure) is rejected immediately with `503 UPSTREAM_SATURATED` carrying `details: { dependency, class, retryAfter }` and a `Retry-After` header. Under sustained saturation (`active === maxConcurrent` for longer than `RPC_SHED_AFTER_MS`, default `2000` ms), queued `background` and then `public` entries are proactively shed in order.
+- **Tuning:** Override any dependency or class policy with `RPC_CLASS_POLICY_JSON` (validated by Zod at startup). Per-class `active`, `queued`, `rejected`, `shed`, `p50WaitMs`, and `p99WaitMs` are exposed under `bulkheads` in `GET /admin/status`. A once-per-minute `WARN` is logged whenever `critical` waits more than 250 ms.
+- **Dev guard:** Outside production, `src/services/stellar/clients.ts` wraps `rpcServer` and binding client server instances in a `Proxy` that logs `rpc call outside bulkhead` with the method name if any RPC method is invoked without an active bulkhead slot.
 
 ## HTTP Caching & Conditional Requests (#99)
 

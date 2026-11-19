@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setupTestEnv } from './helpers/env';
 import { encode, decode, memoryChainCache, chainKey } from '../src/lib/chain-cache';
+import { withCallerClass } from '../src/lib/context';
+import { Bulkhead } from '../src/lib/resilience';
 import { ChainError } from '../src/services/stellar/errors';
 
 setupTestEnv();
@@ -145,4 +147,43 @@ test('contract errors are negatively cached only for the negative TTL', async ()
     (err: any) => err.contractError === 'MarketNotFound',
   );
   assert.equal(calls, 1);
+});
+
+test('higher caller class promotes a queued public load to avoid priority inversion (#300)', async () => {
+  const cache = memoryChainCache();
+  const bh = new Bulkhead('rpc-read', 2, {
+    critical: { weight: 8, reserved: 1, maxQueue: 8, maxWaitMs: 15_000 },
+    agent: { weight: 4, reserved: 0, maxQueue: 8, maxWaitMs: 15_000 },
+    interactive: { weight: 3, reserved: 0, maxQueue: 8, maxWaitMs: 10_000 },
+    public: { weight: 2, reserved: 0, maxQueue: 8, maxWaitMs: 5_000 },
+    background: { weight: 1, reserved: 0, maxQueue: 8, maxWaitMs: 30_000 },
+  });
+
+  // Occupy the single non-reserved slot with an unrelated public call so the next public load queues.
+  let releaseBlocker!: () => void;
+  const blocker = withCallerClass('public', () =>
+    bh.run(() => new Promise<void>((r) => { releaseBlocker = r; })),
+  );
+
+  let loadCalls = 0;
+  const load = () =>
+    bh.run(async () => {
+      loadCalls++;
+      return { value: `loaded-${loadCalls}`, ledger: 999 };
+    });
+
+  // Public caller starts first, queues in bulkhead (not started yet).
+  const pubPromise = withCallerClass('public', () => cache.get('k-promote', { ttlMs: 5000, tags: [] }, load));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Critical caller joins: promotes and uses critical's reserved slot immediately.
+  const critPromise = withCallerClass('critical', () => cache.get('k-promote', { ttlMs: 5000, tags: [] }, load));
+
+  const [pubRes, critRes] = await Promise.all([pubPromise, critPromise]);
+  assert.equal(pubRes.value, 'loaded-1');
+  assert.equal(critRes.value, 'loaded-1');
+  assert.equal(cache.stats().promoted, 1);
+
+  releaseBlocker();
+  await blocker;
 });

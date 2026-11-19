@@ -27,6 +27,7 @@ import { config } from '../config';
 import { AgentPausedError, gateCycle } from '../services/agent-controls.service';
 import { TransactionError } from '../services/stellar/errors';
 import { deadline } from '../lib/resilience';
+import { withCallerClass } from '../lib/context';
 import { shutdownController } from '../lib/shutdown';
 
 // Return shape used by the job tracker
@@ -44,7 +45,8 @@ export interface MarketCycleResult {
 export async function runMarketMakerCycle(
   opts?: { signal?: AbortSignal; priority?: Priority },
 ): Promise<MarketCycleResult | null> {
-  logger.info('Market Maker Agent: starting cycle');
+  return withCallerClass('agent', async () => {
+    logger.info('Market Maker Agent: starting cycle');
 
   // Persistent kill switch / pause (#79): a paused agent is an expected state.
   try {
@@ -299,4 +301,5 @@ export async function runMarketMakerCycle(
   } finally {
     handle.cleanup?.();
   }
+  });
 }

@@ -630,6 +630,7 @@ export const envObjectSchema = z
     // ── Resilience & Timeouts ─────────────────────────────────────────────
     TIMEOUT_RPC_READ_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_WRITE_MS: z.string().default('45000').transform(Number),
+    TIMEOUT_RPC_CONFIRM_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_EVENTS_MS: z.string().default('15000').transform(Number),
     TIMEOUT_LLM_MS: z.string().default('60000').transform(Number),
     TIMEOUT_IPFS_PIN_MS: z.string().default('20000').transform(Number),
@@ -641,9 +642,14 @@ export const envObjectSchema = z
     BULKHEAD_IPFS: z.string().default('4').transform(Number),
     BULKHEAD_RPC_READ: z.string().default('16').transform(Number),
     BULKHEAD_RPC_WRITE: z.string().default('4').transform(Number),
+    BULKHEAD_RPC_CONFIRM: z.string().default('8').transform(Number),
     BULKHEAD_RPC_EVENTS: z.string().default('4').transform(Number),
     BULKHEAD_DATASOURCE: z.string().default('8').transform(Number),
     BULKHEAD_QUEUE: z.string().default('32').transform(Number),
+    // Proactive shedding threshold for saturated RPC bulkheads (#300)
+    RPC_SHED_AFTER_MS: z.string().default('2000').transform(Number).pipe(z.number().int().min(0)),
+    // Optional JSON overrides for per-class bulkhead policies (#300)
+    RPC_CLASS_POLICY_JSON: optionalString,
 
     // Request & cycle deadlines
     HTTP_REQUEST_TIMEOUT_MS: z.string().default('30000').transform(Number),
