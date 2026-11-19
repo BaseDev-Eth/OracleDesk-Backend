@@ -694,6 +694,8 @@ const envSchema = z
     CHAIN_CACHE_TTL_MS: z.string().default('5000').transform(Number),
     CHAIN_CACHE_NEG_TTL_MS: z.string().default('2000').transform(Number),
     CHAIN_CACHE_WAIT_MS: z.string().default('1500').transform(Number),
+    // Per-market provenance endpoint cache TTL (#307).
+    PROVENANCE_CACHE_TTL_SECONDS: z.string().default('300').transform(Number).pipe(z.number().int().min(10).max(86_400)),
   })
   .superRefine((env, ctx) => {
     // ── Login signing-key rotation (#48) ──

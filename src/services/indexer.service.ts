@@ -168,11 +168,26 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
       if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
         await cache.invalidateTag('treasury:capital', event.ledger);
       }
+      if (['MarketResolved', 'MarketCreated'].includes(event.eventName) && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
+        }
+      }
     } else if (event.contractName === 'resolver') {
       if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
         if (marketIdStr) {
           await cache.invalidateTag(`resolver:${marketIdStr}`, event.ledger);
           await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+        }
+      }
+    } else if (event.contractName === 'reasoningRegistry') {
+      if (event.eventName === 'TracePublished' && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
         }
       }
     } else if (event.contractName === 'treasury') {

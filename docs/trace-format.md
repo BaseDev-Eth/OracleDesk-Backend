@@ -135,3 +135,5 @@ JSON Schema URL: `https://api.oracledesk.io/api/v1/schemas/question/v2.json`
   "backendMarketId": "22222222-2222-2222-2222-222222222222"
 }
 ```
+
+For end-to-end verification of a market's question document, resolution spec commitment (`sha256(XDR(ResolutionSpec))`), creation transaction, and every published reasoning trace, see the **Market provenance** section in [docs/api.md](./api.md) (`GET /api/v1/markets/:id/provenance`).

@@ -459,6 +459,28 @@ string; `404 MARKET_NOT_FOUND`.
 `502 CHAIN_ERROR` with `details.contractError: "MarketNotFound"` for an
 unknown id.
 
+#### Market provenance (`GET /markets/:id/provenance`, `GET /markets/on-chain/:onChainMarketId/provenance`)
+
+Public, read-only, rate-limited (`30 req/min/IP`), ledger-aware cached (`shared`, `max-age=60`, ETag derived from `inputsDigest + asOfLedger`) endpoint that audits the complete evidence chain for one market without exposing any locked premium trace content or `previewSources` (#307).
+
+Each link returns `{ name, status, reason?, expected?, observed?, evidence?, verifyCommand? }` where `status` is one of `VERIFIED`, `MISMATCH`, `PENDING`, `UNAVAILABLE`, or `NOT_APPLICABLE`.
+
+Links returned in order:
+1. `proposal` — checks `Market.generationProvenance` (`provider`, `model`, `promptVersion`); `NOT_APPLICABLE` (`PRE_PROVENANCE_MARKET`) for pre-#66 markets.
+2. `question_document` — fetches bytes at `metaUri` via the verified content store/gateway and compares `sha256(bytes)` with `Market.questionHash`. Verify command: `curl -s <IPFS_GATEWAY_URL>/<cid> | sha256sum`.
+3. `question_commitment` — reads `market_core.get_market` and compares `question_hash` and `meta_uri` with the database row. Verify command: `stellar contract invoke --network testnet --id <marketCore> -- get_market --market_id <id>`.
+4. `resolution_commitment` — recomputes `sha256(XDR(ResolutionSpec))` from `Market.resolutionSpec` and compares with both `Market.resolutionHash` and on-chain `resolution_hash` (`PENDING` if the spec is not yet revealed). Independently recompute from the spec JSON with:
+   ```bash
+   echo '<ResolutionSpecJson>' | npx tsx scripts/hash-resolution-spec.ts
+   ```
+5. `resolver_registration` — calls `resolver.state(market_id)`; `PENDING` when `Unconfigured`, `VERIFIED` otherwise.
+6. `creation_transaction` — queries `getTransaction` for `creationTxHash`, `creationInnerTxHash`, and `MarketCreationAttempt.txHash` (handling fee bumps) and verifies a `MarketCreated` event for `onChainMarketId`. Past RPC retention, falls back to the indexed `chain_events` row (`evidence.source = "indexed"`), or reports `UNAVAILABLE` (`OUTSIDE_RETENTION`).
+7. `traces[]` — for every `ReasoningTrace` on the market:
+   - `trace_registry`: compares `reasoning_registry.get_trace` (`trace_hash`, `ipfs_cid`, `market_id`, `agent`) against the stored row (`PENDING` with `TracePublication.status` when unpublished).
+   - `trace_content`: hashes the pinned bytes server-side against `trace_hash` (never returning trace content; reports `NOT_APPLICABLE` / `CONFIDENTIAL` for confidential traces whose hashed bytes are not a public envelope).
+
+Cache invalidation occurs automatically on indexed `MarketCreated`, `MarketResolved`, and `TracePublished` events, when `chainSyncedLedger` advances, or after `PROVENANCE_CACHE_TTL_SECONDS` (default 300 s; `UNAVAILABLE` responses use a 30 s TTL).
+
 #### `POST /markets/generate` (auth, admin, rate-limited)
 
 Starts one market-maker cycle in the background. Admin means the JWT's
