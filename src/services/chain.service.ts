@@ -65,6 +65,7 @@ export { memoryChainCache };
 import { Keypair, scValToNative } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
 import { getFeeOracle, type OperationClass } from './stellar/fees';
+import { recordFeeReceipt, serializeResultXdr } from './stellar/fee-receipt';
 import { timeoutFor, decideExpiry, ExpiredError, type ExpiryDecision, authExpirationLedger } from './stellar/timebounds';
 import {
   getTransactionReader,
@@ -428,6 +429,7 @@ async function submitWrite<T>(
   const store = prismaOutboxStore();
   let outboxRow: ChainTransactionRow = await store.create({
     kind: ref?.kind ?? `${contract}.${method}`,
+    opClass,
     refId: ref?.refId ?? null,
     contract,
     method,
@@ -647,6 +649,7 @@ async function attemptWrite<T>(
         // #35: the write exists in the outbox before anything irreversible happens.
         outboxRow = await store.create({
           kind: ref?.kind ?? `${contract}.${method}`,
+          opClass,
           refId: ref?.refId ?? null,
           contract,
           method,
@@ -984,11 +987,21 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   if (decision === 'FAILED') {
     await submissionRecord('FAILED');
     const errName = contractErrorName(contract, confirmedTx);
+    const resultXdrB64 = serializeResultXdr(confirmedTx);
+    // #308: failed transactions that reached a ledger still pay fees.
+    await recordFeeReceipt(
+      outboxRow,
+      opClass,
+      { inclusionFee: c.inclusionFee, resourceFee: c.minResourceFee, totalFee: c.expectedTotal },
+      confirmedTx,
+      { landedHash: finalHash },
+    );
     // The live caller's error path stands in for the completion handler.
     await store
       .transition(outboxRow.id, ['SUBMITTED'], 'FAILED', {
         landedHash: finalHash,
         ledger: (confirmedTx as any)?.ledger ?? null,
+        resultXdr: resultXdrB64,
         error: errName ?? 'failed on-chain',
         handledAt: new Date(),
       })
@@ -998,24 +1011,16 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
 
   await submissionRecord('LANDED');
 
-  const feeChargedRaw = (confirmedTx as any)?.feeCharged ?? (sendRes as any)?.feeCharged;
-  const feeCharged = feeChargedRaw !== undefined ? BigInt(feeChargedRaw) : c.expectedTotal;
+  const receipt = await recordFeeReceipt(
+    outboxRow,
+    opClass,
+    { inclusionFee: c.inclusionFee, resourceFee: c.minResourceFee, totalFee: c.expectedTotal },
+    confirmedTx,
+    { landedHash: finalHash },
+  );
+  const feeCharged = receipt ? receipt.feeCharged : c.expectedTotal;
   const liveFeeDetails: FeeDetails = { ...c.feeDetails, feeCharged };
-
-  await prisma.chainFee
-    .upsert({
-      where: { txHash: finalHash },
-      create: {
-        txHash: finalHash,
-        opClass,
-        inclusionFee: c.inclusionFee,
-        resourceFee: c.minResourceFee,
-        totalFee: c.expectedTotal,
-        feeCharged,
-      },
-      update: { feeCharged },
-    })
-    .catch((err: any) => logger.warn({ err: err?.message, txHash: finalHash }, 'Failed to record chain fee'));
+  const resultXdrB64 = serializeResultXdr(confirmedTx);
 
   // The on-chain return value decoded with the binding's spec is the source
   // of truth; the simulation result is the fallback (#35).
@@ -1026,6 +1031,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
     .transition(outboxRow.id, ['SUBMITTED', 'PENDING'], 'SUCCESS', {
       landedHash: finalHash,
       ledger: (confirmedTx as any)?.ledger ?? null,
+      resultXdr: resultXdrB64,
       returnValue: printable(value) as object,
     })
     .catch(() => null);

@@ -31,6 +31,7 @@ import { getRedis } from '../../lib/redis';
 import { readClients, rpcServer } from './clients';
 import { contractErrorName } from './errors';
 import { FeeBumpCapExceeded, buildFeeBump, innerInclusionPerOp, planBump } from './fee-bump';
+import { estimateFromRow, inferOpClass, recordFeeReceipt, serializeResultXdr } from './fee-receipt';
 
 export type OutboxStatus = 'BUILT' | 'SIGNED' | 'SUBMITTED' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
 
@@ -43,6 +44,7 @@ export const SIGNED_GRACE_MS = 30_000;
 export interface ChainTransactionRow {
   id: string;
   kind: string;
+  opClass?: string | null;
   refId: string | null;
   contract: string | null;
   method: string | null;
@@ -404,14 +406,23 @@ export async function recoverRow(
   }
 
   if (landed) {
-    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: { toXDR(enc: string): string } };
+    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: string | { toXDR(enc: string): string } };
+    const resultXdrB64 = serializeResultXdr(landed.resp);
     if (landed.status === 'SUCCESS') {
       const value = parseReturnValue(row, anyResp.returnValue);
       const moved = await store.transition(row.id, [...IN_FLIGHT], 'SUCCESS', {
         landedHash: landed.hash,
         ledger: anyResp.ledger ?? null,
+        resultXdr: resultXdrB64,
         returnValue: printableValue(value) ?? undefined,
       });
+      await recordFeeReceipt(
+        moved ?? row,
+        inferOpClass(moved ?? row),
+        estimateFromRow(moved ?? row),
+        landed.resp,
+        { landedHash: landed.hash },
+      );
       if (moved) {
         await applyLandedHash(moved, landed.hash);
         await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash }, store);
@@ -420,7 +431,19 @@ export async function recoverRow(
       }
     } else {
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
-      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', { landedHash: landed.hash, error });
+      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', {
+        landedHash: landed.hash,
+        ledger: anyResp.ledger ?? null,
+        resultXdr: resultXdrB64,
+        error,
+      });
+      await recordFeeReceipt(
+        moved ?? row,
+        inferOpClass(moved ?? row),
+        estimateFromRow(moved ?? row),
+        landed.resp,
+        { landedHash: landed.hash },
+      );
       if (moved) {
         await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash }, store);
         stats.resolved++;
@@ -576,9 +599,19 @@ async function bumpRow(
       // Expected after the inner already landed; poll before deciding.
       const recheck = await server.getTransaction(row.hash!);
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
+        const resultXdrB64 = serializeResultXdr(recheck);
         const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {
           landedHash: row.hash,
+          ledger: (recheck as { ledger?: number }).ledger ?? null,
+          resultXdr: resultXdrB64,
         });
+        await recordFeeReceipt(
+          moved ?? row,
+          inferOpClass(moved ?? row),
+          estimateFromRow(moved ?? row),
+          recheck,
+          { landedHash: row.hash },
+        );
         if (moved) {
           await runCompletionHandler(
             moved,

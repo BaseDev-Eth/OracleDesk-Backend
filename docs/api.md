@@ -1292,6 +1292,71 @@ wallet. The backend never signs or sends it.
 | 422 | `SIMULATION_FAILED` | `details.contractError` names the resolver error. |
 | 503 | `GUARDIAN_NOT_CONFIGURED` | `RESOLVER_GUARDIAN_ADDRESS` is not set. |
 
+#### `GET /admin/fees` (auth, `admin.read`)
+Returns actual on-chain fee spend against simulated estimates per operation class and day, a per-payer breakdown (agent account, channel accounts, and fee-bump payer), legacy estimate row count, and the fee oracle snapshot with observed charged-to-simulated ratios (#39, #308).
+
+```json
+{
+  "oracle": {
+    "networkPassphrase": "Test SDF Network ; September 2015",
+    "stale": false,
+    "policies": {
+      "trade": { "percentile": "p80", "floor": "10000", "cap": "2000000", "budget": "25000000" }
+    },
+    "observed": {
+      "trade": {
+        "sampleCount": 42,
+        "observedResourceRatio": 0.74,
+        "p95ChargedResource": "1850000",
+        "budgetUtilization": 0.074,
+        "warning": false,
+        "refreshedAt": "2026-10-20T00:07:00.000Z"
+      }
+    }
+  },
+  "report": [
+    {
+      "opClass": "trade",
+      "day": "2026-10-20T00:00:00.000Z",
+      "count": 12,
+      "estimatedTotal": "24000000",
+      "chargedTotal": "18200000",
+      "totalCharged": "18200000",
+      "refundedTotal": "5800000",
+      "rentTotal": "120000",
+      "p50Charged": "1450000",
+      "p95Charged": "2100000",
+      "failedCount": 1,
+      "failedCharged": "950000",
+      "chargedToSimulatedRatio": 0.758
+    }
+  ],
+  "byPayer": [
+    {
+      "payer": "G…",
+      "role": "agent",
+      "count": 10,
+      "feeBumpedCount": 0,
+      "estimatedTotal": "20000000",
+      "chargedTotal": "15000000",
+      "refundedTotal": "5000000",
+      "rentTotal": "100000",
+      "failedCount": 1,
+      "failedCharged": "950000"
+    }
+  ],
+  "estimateRowCount": 0
+}
+```
+
+Field semantics (all fee amounts are in stroops as decimal strings):
+- `declaredFee` (stored per row) / `estimatedTotal` (report): the declared envelope fee (`inclusionFee + simulated minResourceFee`, or outer fee when bumped).
+- `chargedTotal` / `totalCharged`: actual stroops debited on-chain (`TransactionResult.feeCharged`), computed strictly from `source = 'RECEIPT'` rows (legacy `ESTIMATE` rows are excluded and counted in `estimateRowCount`).
+- `refundedTotal`: sum of `declaredResourceFee − (nonRefundableCharged + refundableCharged)` across receipts where `SorobanTransactionMetaExtV1` was present.
+- `rentTotal`: sum of `rentFeeCharged` from `SorobanTransactionMetaExtV1`.
+- `failedCount` / `failedCharged`: count and total stroops charged by transactions that reached a ledger with `FAILED` status.
+- `chargedToSimulatedRatio`: ratio of charged resource fees (`nonRefundable + refundable`) to simulated `resourceFee` estimates.
+
 #### `GET /admin/price-markets/health` (auth, `admin.read`)
 Returns Reflector feed health for every open price-mode market (`ACTIVE` / `RESOLVING`) and post-resolution verification verdicts for closed price-mode markets (#309):
 

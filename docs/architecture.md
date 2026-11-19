@@ -108,6 +108,18 @@ To calibrate budgets for production:
 3. Set each class budget in `FEE_POLICY_JSON` to ~1.3x–1.5x the observed peak simulation fee to accommodate ledger state growth and contract rent variations without risking unbounded agent spend.
 Confirmed transactions record fee accounting in `chain_fees`, exposed via `GET /admin/fees` with daily p50/p95 charged quantiles and oracle health snapshots.
 
+### Actual fee receipts and Soroban resource refunds (#308)
+
+Every terminal outbox transaction that reached a ledger (`SUCCESS` or `FAILED`), whether resolved inline in `confirmSubmitted` or asynchronously by `outbox.ts` `recoverRow`, decodes the actual fee charged via `feeReceiptFrom()` (`src/services/stellar/fee-receipt.ts`):
+
+- **Total charged**: `TransactionResult.feeCharged` from `getTransaction`'s `resultXdr`. When the landed result is `txFeeBumpInnerSuccess` or `txFeeBumpInnerFailed`, `innerFeeCharged` records `innerResultPair.result.feeCharged` separately while `feeCharged` records the outer fee paid by the fee payer.
+- **Soroban resource split**: `SorobanTransactionMetaExtV1` from `resultMetaXdr` (`v3().sorobanMeta().ext()` or `v4().sorobanMeta().ext()`) provides `totalNonRefundableResourceFeeCharged`, `totalRefundableResourceFeeCharged`, and `rentFeeCharged`. When the extension is absent, these fields are stored as `null` (distinct from `0`) alongside `metaVersion`.
+- **Inclusion charged & refunds**: When all components are known, `inclusionCharged = feeCharged − (nonRefundable + refundable + rent)` and `refundedResource = declaredResourceFee − (nonRefundable + refundable)`.
+- **Payer attribution**: Parsed directly from the landed envelope (`envelopeXdr` or the matching `feeBumpEnvelopes[].xdr`). Fee-bumped landings attribute the charge to `FEE_PAYER_SECRET`'s account (`feeBumped = true`); unlanded bumps and `EXPIRED` rows never reached a ledger and record nothing.
+- **Idempotency & legacy estimates**: `recordFeeReceipt()` upserts `chain_fees` keyed by the inner hash (outbox identity) with `source = 'RECEIPT'` and never overwrites a `RECEIPT` with an `ESTIMATE`. Pre-#308 rows retain `source = 'ESTIMATE'`, are excluded from charged totals in `GET /admin/fees`, and are counted separately (`estimateRowCount`).
+- **Oracle feedback**: `FeeOracle.refreshObservedMetrics()` (refreshed by `monitor.cron.ts`) caches `observedResourceRatio(opClass)` and `p95ChargedResource(opClass)` from the last `N` receipts. When `p95ChargedResource > 0.8 × budget`, it logs a warning and raises an alert through `alerts.service.ts` without automatically mutating configured budgets.
+- **Backfill**: `scripts/backfill-fee-receipts.ts` backfills `RECEIPT` rows for landed outbox transactions still within RPC retention.
+
 ### Transaction lifetime (#42)
 
 Every transaction built by `chain.service.ts` carries explicit timebounds (`minTime = 0`, `maxTime = submissionTime + timeoutInSeconds`) passed through generated binding options (`MethodOptions.timeoutInSeconds`).

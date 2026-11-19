@@ -21,7 +21,7 @@ import { logger } from '../lib/logger';
 
 export type AlertLevel = 'INFO' | 'WARN' | 'CRITICAL';
 
-export type AlertKind = 'dispute' | 'price_feed' | 'price_verify';
+export type AlertKind = 'dispute' | 'price_feed' | 'price_verify' | 'fee_budget';
 
 export interface DisputeAlert {
   /** Optional for backwards compatibility with pre-#309 callers; defaults to 'dispute'. */
@@ -68,7 +68,19 @@ export interface PriceVerifyAlert {
   metrics?: Record<string, unknown>;
 }
 
-export type Alert = DisputeAlert | PriceFeedAlert | PriceVerifyAlert;
+export interface FeeBudgetAlert {
+  kind: 'fee_budget';
+  level: AlertLevel;
+  title: string;
+  opClass: string;
+  p95ChargedResource: string;
+  budget: string;
+  utilizationRatio: number;
+  observedResourceRatio: number | null;
+  detail?: string;
+}
+
+export type Alert = DisputeAlert | PriceFeedAlert | PriceVerifyAlert | FeeBudgetAlert;
 
 export interface AlertSink {
   /** Stable, secret-free identifier; part of the dedupe key. */
@@ -125,6 +137,8 @@ function webhookEventType(alert: Alert): string {
       return 'oracledesk.price_feed_alert';
     case 'price_verify':
       return 'oracledesk.price_verify_alert';
+    case 'fee_budget':
+      return 'oracledesk.fee_budget_alert';
     case 'dispute':
     default:
       return 'oracledesk.dispute_alert';
@@ -157,6 +171,13 @@ function formatSlackLines(alert: Alert): string[] {
     return [
       `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
       `Market ${alert.onChainMarketId} · event ${alert.eventId} · verdict ${alert.verdict}`,
+      alert.detail,
+    ].filter((line): line is string => Boolean(line));
+  }
+  if (alert.kind === 'fee_budget') {
+    return [
+      `${EMOJI[alert.level]} *${alert.level}* ${alert.title}`,
+      `Class ${alert.opClass} · p95 charged resource ${alert.p95ChargedResource} / budget ${alert.budget} (${Math.round(alert.utilizationRatio * 100)}%)`,
       alert.detail,
     ].filter((line): line is string => Boolean(line));
   }
