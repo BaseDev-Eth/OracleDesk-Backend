@@ -14,6 +14,7 @@ import { isPermanentFailure } from './stellar/failures';
 import { registerHandler, type ChainTransactionRow, type CompletionOutcome } from './stellar/outbox';
 import { Prisma } from '@prisma/client';
 import { enqueueTracePublication } from './trace-publish.service';
+import { attachTracePredicatesToPosition } from './hedge-predicate.service';
 import { tradeTraceAction } from '../lib/trace-actions';
 import {
   bigintToDecimalString,
@@ -58,7 +59,7 @@ export async function applyBuySuccess(
   tradeId: string,
   fill: { sharesOut: bigint; collateralIn: bigint; feeRaw: bigint; txHash: string | null; innerTxHash: string | null },
 ): Promise<void> {
-  const trade = await prisma.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, direction: true, amount: true } });
+  const trade = await prisma.trade.findUnique({ where: { id: tradeId }, select: { id: true, marketId: true, traceId: true, direction: true, amount: true } });
   if (!trade) return;
 
   const fillPriceBps = priceBpsFromRaw(fill.collateralIn, fill.sharesOut);
@@ -78,10 +79,11 @@ export async function applyBuySuccess(
     },
   });
   try {
-    await prisma.position.create({
+    const position = await prisma.position.create({
       data: {
         marketId: trade.marketId,
         tradeId: trade.id,
+        traceId: trade.traceId,
         direction: trade.direction,
         status: 'OPEN',
         entryPrice: effectivePrice,
@@ -94,6 +96,11 @@ export async function applyBuySuccess(
         feesPaidRaw: bigintToDecimalString(fill.feeRaw),
       },
     });
+    if (trade.traceId) {
+      await attachTracePredicatesToPosition(position.id, trade.traceId).catch((err) => {
+        logger.warn({ err, positionId: position.id, traceId: trade.traceId }, 'Failed to attach trace predicates to position');
+      });
+    }
   } catch (err) {
     if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
   }
@@ -176,6 +183,7 @@ export async function executeTrade(payload: TradePayload): Promise<{
   const trade = await prisma.trade.create({
     data: {
       marketId:      payload.marketId,
+      traceId:       payload.traceId ?? null,
       direction:     payload.direction,
       status:        'PENDING',
       amount:        payload.amount,

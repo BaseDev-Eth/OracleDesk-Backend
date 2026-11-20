@@ -19,6 +19,7 @@ import { nowMs } from '../lib/clock';
 import { config } from '../config';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { cancelPositionPredicates } from './hedge-predicate.service';
 import { writeAgentLog } from '../lib/agent-log';
 import { AppError } from '../middlewares/error.middleware';
 import { CONTRACTS } from '../config/contracts';
@@ -287,6 +288,11 @@ async function applyConfirmedExit(
   if (!result) {
     const current = await prisma.position.findUnique({ where: { id: position.id }, select: { status: true } });
     return { closed: current != null && current.status !== 'OPEN', applied: false };
+  }
+  if (result.closed) {
+    await cancelPositionPredicates(position.id).catch((err) => {
+      logger.warn({ err, positionId: position.id }, 'Failed to cancel predicates on closed position');
+    });
   }
   return { closed: result.closed, applied: true };
 }
