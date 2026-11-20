@@ -167,6 +167,22 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
       }
       if (event.eventName === 'Trade' && p.trader === CONTRACTS.treasury) {
         await cache.invalidateTag('treasury:capital', event.ledger);
+        if (event.txHash && p.collateral != null && p.shares != null && p.reserve_yes != null && p.reserve_no != null) {
+          const { recordExecutionFillFromEvent } = await import('./execution-quality.service');
+          await recordExecutionFillFromEvent({
+            txHash: event.txHash,
+            ledger: event.ledger,
+            isBuy: Boolean(p.is_buy),
+            outcome: String(p.outcome ?? 'Yes'),
+            collateral: BigInt(String(p.collateral)),
+            shares: BigInt(String(p.shares)),
+            fee: BigInt(String(p.fee ?? 0)),
+            reserveYes: BigInt(String(p.reserve_yes)),
+            reserveNo: BigInt(String(p.reserve_no)),
+          }).catch((err) => {
+            logger.warn({ err, txHash: event.txHash }, 'Execution quality fill recording failed');
+          });
+        }
       }
     } else if (event.contractName === 'resolver') {
       if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {

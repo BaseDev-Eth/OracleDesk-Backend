@@ -15,6 +15,12 @@ import { registerHandler, type ChainTransactionRow, type CompletionOutcome } fro
 import { Prisma } from '@prisma/client';
 import { enqueueTracePublication } from './trace-publish.service';
 import { attachTracePredicatesToPosition } from './hedge-predicate.service';
+import {
+  classifyLiquidityBucket,
+  markExecutionReportOutcome,
+  recordExecutionQuoteAttempt,
+} from './execution-quality.service';
+import { priceYesBps } from '../generated/fpmm';
 import { tradeTraceAction } from '../lib/trace-actions';
 import {
   bigintToDecimalString,
@@ -117,12 +123,19 @@ export async function handleTradeBuyOutcome(row: ChainTransactionRow, outcome: C
   if (outcome.status !== 'SUCCESS') {
     // EXPIRED rows the worker resolves were abandoned mid-rebuild or after a
     // crash: the envelope never landed, so the trade definitively failed.
+    const errText = outcome.status === 'EXPIRED' ? 'expired unsubmitted' : (outcome.error ?? 'failed on-chain');
     await prisma.trade.updateMany({
       where: { id: tradeId, status: 'PENDING' },
       data: {
         status: 'FAILED',
-        errorMessage: outcome.status === 'EXPIRED' ? 'expired unsubmitted' : (outcome.error ?? 'failed on-chain'),
+        errorMessage: errText,
       },
+    });
+    const isSlippage = /SlippageExceeded/i.test(errText);
+    await markExecutionReportOutcome({
+      tradeId,
+      status: isSlippage ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+      failureCode: isSlippage ? 'SlippageExceeded' : outcome.status,
     });
     return;
   }
@@ -317,6 +330,12 @@ export async function executeTrade(payload: TradePayload): Promise<{
           where: { id: trade.id },
           data:  { status: 'FAILED', errorMessage: String(err) },
         });
+        const isSlippage = contractError === 'SlippageExceeded' || /SlippageExceeded/i.test(String(err));
+        await markExecutionReportOutcome({
+          tradeId: trade.id,
+          status: isSlippage ? 'SLIPPAGE_EXCEEDED' : 'FAILED',
+          failureCode: isSlippage ? 'SlippageExceeded' : (contractError ?? failure ?? 'TRADE_FAILED'),
+        });
         await logAgentAction('TRADER', 'ERROR', 'TRADE_EXECUTION_FAILED', payload.marketId, {
           tradeId: trade.id,
           error:   String(err),
@@ -479,6 +498,13 @@ async function submitTradeTransaction(
   // fee_bps is fixed at market creation; the fee is charged on collateral in.
   const onChain = await getOnChainMarket(market.onChainMarketId);
   const feeRaw = mulDivCeil(collateralIn, BigInt(onChain.fee_bps), 10_000n);
+  const reserveYes = BigInt(onChain.reserve_yes);
+  const reserveNo = BigInt(onChain.reserve_no);
+  const liquidityBucket = classifyLiquidityBucket(reserveYes, reserveNo);
+  const yesMidBps = reserveYes > 0n && reserveNo > 0n ? Number(priceYesBps(reserveYes, reserveNo)) : null;
+  const quoteMidBps = yesMidBps === null ? null : (payload.direction === 'YES' ? yesMidBps : 10_000 - yesMidBps);
+  const decisionMidBps = priceToBps(payload.price);
+  let quoteAttempt = 0;
 
   logger.info(
     {
@@ -529,6 +555,26 @@ async function submitTradeTransaction(
         }
       }
       const minSharesOut = (quoted * (10_000n - AGENT_SLIPPAGE_BPS)) / 10_000n;
+      if (attemptId) {
+        quoteAttempt++;
+        await recordExecutionQuoteAttempt({
+          kind: 'BUY',
+          tradeId: attemptId,
+          marketId: market.id,
+          direction: payload.direction,
+          decisionMidBps,
+          slippageBoundBps: Number(AGENT_SLIPPAGE_BPS),
+          liquidityBucket,
+          quote: {
+            attempt: quoteAttempt + rebuildCount * 100,
+            quotedAt: new Date().toISOString(),
+            quoteMidBps,
+            quotedOutRaw: quoted.toString(),
+            boundRaw: minSharesOut.toString(),
+            quotedPriceBps: quoted > 0n ? Number((collateralIn * 10_000n) / quoted) : null,
+          },
+        });
+      }
       return {
         market_id: market.onChainMarketId!,
         outcome,
@@ -545,6 +591,13 @@ async function submitTradeTransaction(
     },
     attemptId ? { kind: 'trade.buy', refId: attemptId } : undefined,
   );
+  if (attemptId && result.txHash) {
+    await markExecutionReportOutcome({
+      tradeId: attemptId,
+      status: 'PENDING',
+      landedTxHash: result.txHash,
+    });
+  }
   return {
     txHash: result.txHash,
     dryRun: result.mode === 'dry-run',

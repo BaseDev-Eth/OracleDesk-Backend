@@ -536,6 +536,49 @@ model PositionExit {
   @@map("position_exits")
 }
 
+/// Execution quality & implementation shortfall per agent buy/sell (#295).
+model ExecutionReport {
+  id                   String         @id @default(uuid())
+  /// BUY | SELL
+  kind                 String
+  tradeId              String?        @unique
+  positionExitId       String?        @unique
+  marketId             String
+  direction            TradeDirection
+  decisionLedger       Int?
+  decisionMidBps       Int?
+  slippageBoundBps     Int
+  /// Array of { attempt, quotedAt, quoteMidBps?, quotedOutRaw, boundRaw, quotedPriceBps }
+  quotes               Json           @default("[]")
+  quoteCount           Int            @default(0)
+  /// PENDING | CONFIRMED | SLIPPAGE_EXCEEDED | FAILED
+  status               String         @default("PENDING")
+  failureCode          String?
+  landedTxHash         String?
+  fillLedger           Int?
+  ledgerDelay          Int?
+  fillCollateralRaw    Decimal?       @db.Decimal(39, 0)
+  fillSharesRaw        Decimal?       @db.Decimal(39, 0)
+  fillFeeRaw           Decimal?       @db.Decimal(39, 0)
+  fillPriceBps         Int?
+  postReserveYesRaw    Decimal?       @db.Decimal(39, 0)
+  postReserveNoRaw     Decimal?       @db.Decimal(39, 0)
+  /// THIN | MEDIUM | DEEP | UNKNOWN
+  liquidityBucket      String?
+  delayBps             Int?
+  impactBps            Int?
+  feeBps               Int?
+  residualBps          Int?
+  totalShortfallBps    Int?
+  createdAt            DateTime       @default(now()) @db.Timestamptz(3)
+  updatedAt            DateTime       @updatedAt @db.Timestamptz(3)
+
+  @@index([marketId, createdAt])
+  @@index([status, liquidityBucket])
+  @@index([landedTxHash])
+  @@map("execution_reports")
+}
+
 enum AgentControlScope {
   ALL
   MARKET_MAKER

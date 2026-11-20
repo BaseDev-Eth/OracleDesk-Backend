@@ -20,6 +20,7 @@ import {
   silenceAlert,
   getSystemStatus,
   getChainFeesReport,
+  getExecutionQuality,
   pauseAgentControl,
   postGrantAdmin,
   postRevokeAdmin,
@@ -76,6 +77,7 @@ router.post('/agents/:agent/pause', requirePermission('agents.manage'), pauseAge
 router.post('/agents/:agent/resume', requirePermission('agents.manage'), resumeAgentControl);
 router.get('/status', requirePermission('admin.read'), getSystemStatus);
 router.get('/fees', requirePermission('admin.read'), getChainFeesReport);
+router.get('/execution-quality', requirePermission('admin.read'), getExecutionQuality);
 router.get('/disputes', requirePermission('disputes.manage'), getDisputes);
 router.post('/disputes/:id/ack', requirePermission('disputes.manage'), ackDispute);
 router.post('/disputes/:id/cancel-tx', requirePermission('disputes.manage'), cancelDisputeTx);
@@ -116,6 +118,7 @@ router.post('/agents/:agent/pause', pauseAgentControl);
 router.post('/agents/:agent/resume', resumeAgentControl);
 router.get('/status', getSystemStatus);
 router.get('/fees', getChainFeesReport);
+router.get('/execution-quality', getExecutionQuality);
 router.get('/disputes', getDisputes);
 router.post('/disputes/:id/ack', ackDispute);
 router.post('/disputes/:id/cancel-tx', cancelDisputeTx);
