@@ -1048,6 +1048,32 @@ model PaymentEvent {
   @@map("payment_events")
 }
 
+enum PaymentClaimChannel {
+  LEGACY_UNLOCK
+  PAYMENT_INTENT
+  X402_SETTLEMENT
+  REFUND
+  BACKFILL
+}
+
+model PaymentClaim {
+  id                   String              @id @default(uuid())
+  txHash               String
+  opIndex              Int                 @default(0)
+  eventIndex           Int                 @default(0)
+  channel              PaymentClaimChannel
+  userId               String?
+  amountRaw            String
+  paymentEventId       String?
+  x402SettlementTxHash String?
+  createdAt            DateTime            @default(now()) @db.Timestamptz(3)
+
+  @@unique([txHash, opIndex, eventIndex])
+  @@index([txHash])
+  @@index([userId])
+  @@map("payment_claims")
+}
+
 // User-defined spending approvals for nanopayment trace access
 model SpendingAllowance {
   id            String             @id @default(uuid())

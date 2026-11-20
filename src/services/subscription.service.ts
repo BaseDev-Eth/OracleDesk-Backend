@@ -12,7 +12,8 @@ import { logger } from '../lib/logger';
 import { config } from '../config';
 import { CONTRACTS, PAYMENTS_RECIPIENT } from '../config/contracts';
 import { decimalToBigint, formatUsdc, toDisplayUsdc } from '../lib/amounts';
-import { verifyUsdcTransfer } from './payment-verification.service';
+import { selectClaimableTransfers, verifyUsdcTransfer } from './payment-verification.service';
+import { claimTransferEvents } from './payment-claims.service';
 import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import { summarizeProvenance } from '../lib/llm/provenance';
@@ -495,6 +496,18 @@ export async function settleVerifiedTransfer(
       } as any,
     },
   });
+
+  if ((tx as any).paymentClaim?.create) {
+    const claimedEvents = selectClaimableTransfers(transfer);
+    await claimTransferEvents(tx, {
+      txHash,
+      channel: paymentIntentId ? 'PAYMENT_INTENT' : 'LEGACY_UNLOCK',
+      userId,
+      paymentEventId: paymentEvent.id,
+      totalAmountRaw: amountRaw,
+      transfers: claimedEvents,
+    });
+  }
 
   return {
     subscription: created,
