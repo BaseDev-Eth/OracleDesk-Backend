@@ -847,9 +847,16 @@ export const envObjectSchema = z
     MONEY_AUDIT_MAX_RPC_CALLS: z.string().default('200').transform(Number)
       .pipe(z.number().int().min(0)),
 
-    // ── Copy Trading (Issue #151) ─────────────────────────────────────────
+    // ── Copy Trading (Issue #151, #294) ───────────────────────────────────
     COPY_TRADE_TTL_MINUTES: z.string().default('30').transform(Number),
     COPY_TRADE_MAX_PENDING: z.string().default('5').transform(Number),
+    COPY_TRADE_MAX_IMPACT_BPS: z.string().optional()
+      .transform((v) => (v == null || v === '' ? null : Number(v)))
+      .pipe(z.number().int().min(1).max(10_000).nullable()),
+    COPY_TRADE_FLOW_WINDOW_MINUTES: z.string().default('60').transform(Number)
+      .pipe(z.number().int().min(1).max(10_080)),
+    COPY_TRADE_POOL_MAX_AGE_LEDGERS: z.string().default('12').transform(Number)
+      .pipe(z.number().int().min(0)),
 
     // ── Socket.io throttling & slow-consumer guard (Issue #96) ─────────────
     SOCKET_PRICE_TICK_MS: z.string().default('1000').transform(Number),

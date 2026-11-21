@@ -603,3 +603,13 @@ export async function abandonChainTransaction(req: Request, res: Response): Prom
   const id = outboxId(req);
   sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
 }
+
+/** GET /admin/execution-quality — implementation shortfall, slippage failures & recommended bounds (#295). */
+export async function getExecutionQuality(req: Request, res: Response): Promise<void> {
+  const { getExecutionQualitySummary } = await import('../services/execution-quality.service');
+  const rawDays = req.query.windowDays;
+  const windowDays = typeof rawDays === 'string' && /^[1-9]\d*$/.test(rawDays)
+    ? Math.min(365, Number(rawDays))
+    : 30;
+  sendSuccess(res, await getExecutionQualitySummary({ windowDays }));
+}
