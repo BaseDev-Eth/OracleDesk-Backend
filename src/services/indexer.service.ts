@@ -186,11 +186,26 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
           });
         }
       }
+      if (['MarketResolved', 'MarketCreated'].includes(event.eventName) && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
+        }
+      }
     } else if (event.contractName === 'resolver') {
       if (['ResolutionProposed', 'ResolutionFinalized', 'PriceResolution'].includes(event.eventName)) {
         if (marketIdStr) {
           await cache.invalidateTag(`resolver:${marketIdStr}`, event.ledger);
           await cache.invalidateTag(`market:${marketIdStr}`, event.ledger);
+        }
+      }
+    } else if (event.contractName === 'reasoningRegistry') {
+      if (event.eventName === 'TracePublished' && marketIdStr) {
+        const m = await prisma.market.findUnique({ where: { onChainMarketId: BigInt(marketIdStr) }, select: { id: true } });
+        if (m) {
+          const { invalidateProvenanceCache } = await import('./provenance.service');
+          await invalidateProvenanceCache(m.id);
         }
       }
     } else if (event.contractName === 'treasury') {
@@ -263,6 +278,13 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
     return;
   }
 
+  // #309: verify price-mode resolutions independently after the poll tick.
+  if (event.contractName === 'resolver' && event.eventName === 'PriceResolution') {
+    const verifier = await import('./price-resolution-verifier.service');
+    verifier.schedulePriceVerification(event.id);
+    return;
+  }
+
   if (event.contractName === 'reasoningRegistry' && event.eventName === 'TracePublished') {
     const traceHash =
       typeof p.trace_hash === 'string'
@@ -303,6 +325,79 @@ async function applySideEffects(event: DecodedEvent): Promise<void> {
         data: { status: 'CONFIRMED', confirmedAt: new Date(), lastError: null },
       });
     }
+    return;
+  }
+
+  // #306: registry governance events trigger an authoritative chain verdict re-check
+  // (never compute the verdict from the event payload alone).
+  if (
+    event.contractName === 'reasoningRegistry' &&
+    (event.eventName === 'TraceFlagged' || event.eventName === 'TraceUnflagged')
+  ) {
+    if (p.trace_id !== undefined) {
+      const onChainTraceId = BigInt(p.trace_id);
+      const { scheduleVerdictRecheck } = await import('./trace-audit.service');
+      scheduleVerdictRecheck([onChainTraceId]);
+    }
+    return;
+  }
+
+  if (event.contractName === 'reasoningRegistry' && event.eventName === 'AgentRevoked') {
+    const agent = String(p.agent ?? '');
+    if (!agent) return;
+    const effectiveFrom = BigInt(p.effective_from ?? 0);
+    const reason = String(p.reason ?? '');
+
+    const agentRevocationDb = (prisma as unknown as {
+      agentRevocation: { upsert(args: unknown): Promise<unknown> };
+    }).agentRevocation;
+    await agentRevocationDb.upsert({
+      where: { agent },
+      create: { agent, effectiveFrom, reason, observedLedger: event.ledger },
+      update: { effectiveFrom, reason, observedLedger: event.ledger },
+    });
+
+    const effectiveDate = new Date(Number(effectiveFrom) * 1000);
+    // Select affected traces by ReasoningTrace.agentWallet, falling back to latest TraceAudit.agent where null
+    const directTraces = await prisma.reasoningTrace.findMany({
+      where: {
+        onChainTraceId: { not: null },
+        agentWallet: agent,
+        createdAt: { gte: effectiveDate },
+      },
+      select: { onChainTraceId: true },
+    });
+    const nullWalletTraces = await prisma.reasoningTrace.findMany({
+      where: {
+        onChainTraceId: { not: null },
+        agentWallet: null,
+        createdAt: { gte: effectiveDate },
+      },
+      select: {
+        onChainTraceId: true,
+        audits: {
+          orderBy: { checkedAt: 'desc' },
+          take: 1,
+          select: { agent: true },
+        },
+      },
+    });
+
+    const affectedIds = new Set<bigint>();
+    for (const t of directTraces) {
+      if (t.onChainTraceId !== null) affectedIds.add(t.onChainTraceId);
+    }
+    for (const t of nullWalletTraces) {
+      if (t.onChainTraceId !== null && t.audits[0]?.agent?.toUpperCase() === agent.toUpperCase()) {
+        affectedIds.add(t.onChainTraceId);
+      }
+    }
+
+    if (affectedIds.size > 0) {
+      const { scheduleVerdictRecheck } = await import('./trace-audit.service');
+      scheduleVerdictRecheck(Array.from(affectedIds));
+    }
+    return;
   }
 }
 

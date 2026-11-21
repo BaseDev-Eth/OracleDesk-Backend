@@ -32,6 +32,7 @@ import {
   getOperationSep7Status,
   issueOperationSep7,
   getDisputes,
+  getPriceMarketsHealth,
   listReconciliationRuns,
   listTreasuryOperations,
   recordTreasuryOperation,

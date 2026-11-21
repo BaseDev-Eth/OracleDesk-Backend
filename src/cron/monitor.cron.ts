@@ -116,6 +116,18 @@ export function startMonitorCron(): void {
     return { outcome: 'SUCCESS', counters: { removed: result.removed } };
   });
 
+  // Fee oracle observed resource ratios & budget warnings (#308) — every 15 minutes.
+  cron.schedule('7,22,37,52 * * * *', () => tick('fee-oracle-observed', async () => {
+    const startedAt = new Date();
+    try {
+      await getFeeOracle().refreshObservedMetrics();
+      recordCronRun('fee-oracle-observed', 'success', startedAt, new Date());
+    } catch (err) {
+      recordCronRun('fee-oracle-observed', 'failure', startedAt, new Date(), err);
+      logger.error({ err }, 'Monitor cron: fee oracle observed metrics refresh failed');
+    }
+  }));
+
   logger.info('Monitor cron started');
 }
 

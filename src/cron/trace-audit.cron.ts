@@ -3,9 +3,13 @@ import { logger } from '../lib/logger';
 import { scheduleJob } from './registry';
 
 /**
- * Trace Audit Cron.
- * Periodically walks the reasoning-registry on-chain index,
- * verifies IPFS content hashes, detects discrepancies, and relinks missed records.
+ * Trace Audit Cron (#150, #306).
+ * - Full audit (`TRACE_AUDIT_CRON`): walks the reasoning-registry on-chain
+ *   index, verifies IPFS content hashes, evaluates `trace_verdict`, detects
+ *   discrepancies, and relinks missed records.
+ * - Fast lane (`TRACE_VERDICT_CRON`, default every 10 minutes): re-checks
+ *   flagged/non-VALID traces and traces of revoked agents only.
+ * Both schedules share `isRunning` so they never overlap.
  */
 export function startTraceAuditCron(): void {
   scheduleJob('trace-audit', async () => {

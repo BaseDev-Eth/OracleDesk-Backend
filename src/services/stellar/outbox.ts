@@ -45,6 +45,7 @@ export const SIGNED_GRACE_MS = 30_000;
 export interface ChainTransactionRow {
   id: string;
   kind: string;
+  opClass?: string | null;
   refId: string | null;
   contract: string | null;
   method: string | null;
@@ -649,14 +650,23 @@ export async function recoverRow(
   }
 
   if (landed) {
-    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: { toXDR(enc: string): string } };
+    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: string | { toXDR(enc: string): string } };
+    const resultXdrB64 = serializeResultXdr(landed.resp);
     if (landed.status === 'SUCCESS') {
       const value = parseReturnValue(row, anyResp.returnValue);
       const moved = await store.transition(row.id, [...IN_FLIGHT], 'SUCCESS', {
         landedHash: landed.hash,
         ledger: anyResp.ledger ?? null,
+        resultXdr: resultXdrB64,
         returnValue: printableValue(value) ?? undefined,
       });
+      await recordFeeReceipt(
+        moved ?? row,
+        inferOpClass(moved ?? row),
+        estimateFromRow(moved ?? row),
+        landed.resp,
+        { landedHash: landed.hash },
+      );
       if (moved) {
         await applyLandedHash(moved, landed.hash);
         await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
@@ -867,6 +877,13 @@ async function bumpRow(
           landedHash: row.hash,
           ledger: recheckLedger,
         });
+        await recordFeeReceipt(
+          moved ?? row,
+          inferOpClass(moved ?? row),
+          estimateFromRow(moved ?? row),
+          recheck,
+          { landedHash: row.hash },
+        );
         if (moved) {
           await runCompletionHandler(
             moved,

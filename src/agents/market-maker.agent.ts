@@ -167,7 +167,7 @@ export async function runMarketMakerCycle(
       return null;
     }
     proposal = prepared.proposal;
-    const resolutionDetails = prepared.resolution;
+    let resolutionDetails: Record<string, unknown> | null = prepared.resolution ? { ...prepared.resolution } : null;
 
     signal.throwIfAborted();
 
@@ -194,6 +194,12 @@ export async function runMarketMakerCycle(
       if (plan.spec && plan.question) {
         marketSpec = plan.spec;
         proposal = { ...proposal, market_question: plan.question };
+        if (plan.resolution) {
+          resolutionDetails = {
+            ...(resolutionDetails ?? {}),
+            price: plan.resolution,
+          };
+        }
       }
     }
 

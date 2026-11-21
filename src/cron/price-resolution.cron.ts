@@ -2,13 +2,17 @@ import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { scheduleJob } from './registry';
 import { revealPriceSpec, runPriceResolutionTick } from '../services/price-resolution.service';
+import { captureCloseSnapshot, runPriceFeedMonitor } from '../services/price-feed-monitor.service';
+import { sweepUnverifiedPriceResolutions } from '../services/price-resolution-verifier.service';
 import { resolverState } from '../services/chain.service';
 import type { ResolutionSpecJson } from '../lib/resolution-spec';
 
 /**
- * Price-mode markets (#90): every five minutes, reveal any price spec the
- * resolver still reports Unconfigured, then try `resolve_price` for markets
- * past close. The retry/escalation policy lives in runPriceResolutionTick.
+ * Price-mode markets (#90, #309):
+ * - Every 5 minutes: reveal unconfigured specs, capture close snapshots and
+ *   resolve closed price markets, monitor open price markets inside the close
+ *   window, and sweep any resolved price markets missing a verification check.
+ * - Every 15 minutes: monitor all open price markets' Reflector feeds.
  */
 export function startPriceResolutionCron(): void {
   scheduleJob('price-resolution', async () => {

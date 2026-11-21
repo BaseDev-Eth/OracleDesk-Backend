@@ -158,6 +158,15 @@ enum TraceAuditStatus {
   UNSIGNED
 }
 
+/// Governance verdict returned by reasoning-registry `trace_verdict` (#306).
+enum TraceVerdictKind {
+  VALID
+  HASH_MISMATCH
+  FLAGGED
+  AGENT_REVOKED_AFTER
+  UNKNOWN
+}
+
 enum AgentType {
   MARKET_MAKER
   TRADER
@@ -682,6 +691,8 @@ model ReasoningTrace {
   @@index([traceHash])
   @@index([createdAt])
   @@index([marketId, createdAt])
+  @@index([verdict, verdictCheckedAt])
+  @@index([agentWallet])
   /// Retention (#73) keeps signals cited by a trace: `sourcesUsed @> [{"signalId": …}]`.
   @@index([sourcesUsed(ops: JsonbPathOps)], type: Gin)
   @@map("reasoning_traces")
@@ -1505,6 +1516,8 @@ model ChainTransaction {
   id String @id @default(uuid())
   /// Completion-handler key: market.create | trade.buy | trade.sell | trace.publish | <contract>.<method>.
   kind   String
+  /// Fee operation class: market_create | trade | trace_publish | maintenance (#308).
+  opClass String? @map("op_class")
   /// Domain row the write belongs to (Market.id | Trade.id | PositionExit.id | ReasoningTrace.id).
   refId  String?
   contract String?
@@ -1552,17 +1565,32 @@ model ChainTransaction {
   @@map("chain_transactions")
 }
 
-/// On-chain fees recorded per transaction (#39).
+/// On-chain fees recorded per transaction (#39, #308).
 model ChainFee {
-  txHash       String   @id @map("tx_hash")
-  opClass      String   @map("op_class")
-  inclusionFee BigInt   @map("inclusion_fee")
-  resourceFee  BigInt   @map("resource_fee")
-  totalFee     BigInt   @map("total_fee")
-  feeCharged   BigInt?  @map("fee_charged")
-  createdAt    DateTime @default(now()) @map("created_at")
+  txHash               String   @id @map("tx_hash")
+  opClass              String   @map("op_class")
+  inclusionFee         BigInt   @map("inclusion_fee")
+  resourceFee          BigInt   @map("resource_fee")
+  totalFee             BigInt   @map("total_fee")
+  feeCharged           BigInt?  @map("fee_charged")
+  outboxId             String?  @map("outbox_id")
+  landedHash           String?  @map("landed_hash")
+  payer                String?
+  feeBumped            Boolean  @default(false) @map("fee_bumped")
+  success              Boolean?
+  innerFeeCharged      BigInt?  @map("inner_fee_charged")
+  nonRefundableCharged BigInt?  @map("non_refundable_charged")
+  refundableCharged    BigInt?  @map("refundable_charged")
+  rentCharged          BigInt?  @map("rent_charged")
+  declaredFee          BigInt?  @map("declared_fee")
+  ledger               Int?
+  /// ESTIMATE | RECEIPT
+  source               String   @default("ESTIMATE")
+  createdAt            DateTime @default(now()) @map("created_at")
 
   @@index([opClass, createdAt])
+  @@index([payer, createdAt])
+  @@index([outboxId])
   @@map("chain_fees")
 }
 
@@ -1776,7 +1804,7 @@ model DisputeReview {
   @@map("dispute_reviews")
 }
 
-/// One alert sent (or attempted) for a review, deduplicated by `dedupeKey`.
+/// One alert sent (or attempted) for a subject, deduplicated by `dedupeKey`.
 model AlertDelivery {
   id        String    @id @default(uuid())
   /// Dispute review (#92). Null for operational alerts (#226).
@@ -1797,6 +1825,7 @@ model AlertDelivery {
   error     String?
 
   @@index([reviewId])
+  @@index([subjectId])
   @@map("alert_deliveries")
 }
 

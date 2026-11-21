@@ -72,6 +72,19 @@ export async function initiateCopyTrade(req: Request, res: Response): Promise<vo
     return;
   }
 
+  // #306: copy-trading moves user money — require a fresh VALID registry verdict.
+  const verdict = await getFreshTraceVerdict(trace as any);
+  if (verdict.kind !== TraceVerdictKind.VALID) {
+    sendError(
+      res,
+      409,
+      'TRACE_NOT_TRUSTED',
+      `Copy-trading is blocked because this trace verdict is ${verdict.kind}`,
+      { verdict },
+    );
+    return;
+  }
+
   const market = trace.market;
   if (market.onChainMarketId === null) {
     sendError(res, 409, 'MARKET_NOT_ON_CHAIN', 'This market is not on-chain yet');
