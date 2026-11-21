@@ -8,6 +8,7 @@
  */
 import type { PromptDef } from './define';
 import { forecastV1 } from './forecast.v1';
+import { forecastV2 } from './forecast.v2';
 import { hedgeConditionsV1 } from './hedge-conditions.v1';
 import { hedgeConditionsV2 } from './hedge-conditions.v2';
 import { marketProposalV1 } from './market-proposal.v1';

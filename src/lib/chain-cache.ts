@@ -4,6 +4,8 @@ import { config } from '../config';
 import { logger } from './logger';
 import { getRedis } from './redis';
 import { ChainError } from '../services/stellar/errors';
+import { currentCallerClass, isHigherCallerClass, type CallerClass } from './context';
+import { withLoadTracker, type LoadTracker } from './resilience';
 
 export interface CacheEntry<T> {
   value: T;
@@ -457,9 +459,14 @@ export function memoryChainCache(): ChainCache {
         }
       };
 
-      const promise = execute().finally(() => inFlight.delete(key));
-      inFlight.set(key, promise);
-      return promise;
+      return runSingleFlight(inFlight, key, execute, {
+        onCoalesced: () => {
+          coalesced++;
+        },
+        onPromoted: () => {
+          promoted++;
+        },
+      });
     },
 
     stats(): ChainCacheStats {
@@ -848,9 +855,14 @@ export function redisChainCache(redis: Redis): ChainCache {
         }
       };
 
-      const promise = execute().finally(() => inFlight.delete(key));
-      inFlight.set(key, promise);
-      return promise;
+      return runSingleFlight(inFlight, key, execute, {
+        onCoalesced: () => {
+          coalesced++;
+        },
+        onPromoted: () => {
+          promoted++;
+        },
+      });
     },
 
     stats(): ChainCacheStats {

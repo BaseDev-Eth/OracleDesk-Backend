@@ -46,6 +46,7 @@ export const TraceDocV1 = z
           .strict(),
       )
       .max(50),
+    citedSourceIds: z.array(z.string()).max(50).optional(),
     betFraction: z.number().nullable(),
     betSizeUsdc: z.number().nullable(),
     hedgeConditions: z.array(z.string().max(500)).max(20),
@@ -253,6 +254,7 @@ export function buildTraceDoc(params: {
   edge: number;
   confidenceInterval: { lower: number; upper: number };
   sourcesUsed: Array<{ source: string; weight: number; signal: string; rawValue?: number | null }>;
+  citedSourceIds?: string[];
   betFraction?: number | null;
   betSizeUsdc?: number | null;
   hedgeConditions?: string[] | null;
@@ -299,6 +301,7 @@ export function buildTraceDoc(params: {
     edge: Math.max(-1, Math.min(1, params.edge)),
     confidenceInterval: ci,
     sourcesUsed,
+    ...(params.citedSourceIds !== undefined ? { citedSourceIds: params.citedSourceIds.slice(0, 50) } : {}),
     betFraction: params.betFraction ?? null,
     betSizeUsdc: params.betSizeUsdc ?? null,
     hedgeConditions: (params.hedgeConditions ?? []).slice(0, 20).map((h) => h.slice(0, 500)),

@@ -150,7 +150,9 @@ Chain-write probes (#220): `outbox`, `signers` and `channels` are also listed. E
 
 `GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
 
-`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
+`GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, per-dependency and per-class RPC/outbound bulkhead metrics (`bulkheads`), and process info.
+
+When an outbound dependency bulkhead rejects or sheds a request, the API returns `503 UPSTREAM_SATURATED` with a `Retry-After` header (seconds) and `error.details`: `{ dependency, class, retryAfter }`.
 
 `chainWrites` (#220): `{ writer, outbox, handlers, balances, channels }`. `outbox` is the row count per status (terminal statuses count only rows whose handler has not run) plus `inFlight`, `oldestInFlightMs`, `pastMaxTime` and `oldestUnhandledMs`. `handlers` is `{ scope: "instance", kinds: { <kind>: { count, lastErrorClass, since } } }` (error class only, never the message). `balances` is the cached snapshot `{ stale, takenAt, accounts: [{ publicKey, role: agent|feePayer|channel, stroops, minStroops, runwayHours, estimated?, checkedAt, error? }] }` with stroops as decimal strings; `runwayHours` is `(stroops − minStroops) / (24 h spend / 24)` and `null` with no spend history; `estimated` means part of the spend is `total_fee` (no `fee_charged`) or a bump's bid fee. `channels` is `{ total, healthy, leased, accounts: [{ publicKey, healthy, stroops, checkedAt }] }`. Public keys only, never secrets.
 

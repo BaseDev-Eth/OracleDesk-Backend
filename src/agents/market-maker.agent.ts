@@ -33,6 +33,7 @@ import { config } from '../config';
 import { AgentPausedError, gateCycle } from '../services/agent-controls.service';
 import { TransactionError } from '../services/stellar/errors';
 import { deadline } from '../lib/resilience';
+import { withCallerClass } from '../lib/context';
 import { shutdownController } from '../lib/shutdown';
 import { correlation, newId } from '../lib/context';
 import { recordAgentDecision, type RecordAgentDecisionInput } from '../services/agent-decision.service';
@@ -462,4 +463,5 @@ export async function runMarketMakerCycle(
   } finally {
     handle.cleanup?.();
   }
+  });
 }
