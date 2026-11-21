@@ -709,7 +709,9 @@ export async function recoverRow(
   if (row.status === 'SIGNED' && row.envelopeXdr) {
     try {
       const signed = TransactionBuilder.fromXDR(row.envelopeXdr, config.STELLAR_NETWORK_PASSPHRASE) as Transaction;
-      const resp = await server.sendTransaction(signed);
+      const resp = await withCallerClass('agent', () =>
+        withTimeout('rpc-write', () => server.sendTransaction(signed)),
+      );
       if (resp.status === 'PENDING' || resp.status === 'DUPLICATE') {
         await store.transition(row.id, ['SIGNED'], 'SUBMITTED', { submitLedger: resp.latestLedger ?? null });
         stats.resubmitted++;
@@ -730,7 +732,9 @@ export async function recoverRow(
 
   // Submitted but not yet visible: fee-bump when stuck past the threshold (#38).
   if (!config.FEE_BUMP_ENABLED) return stats;
-  const latestLedger = deps.ledgerOverride ?? (await server.getLatestLedger()).sequence;
+  const latestLedger =
+    deps.ledgerOverride ??
+    (await withCallerClass('agent', () => withTimeout('rpc-read', () => server.getLatestLedger()))).sequence;
   if (!shouldBump(row, latestLedger, nowSecs, {
     afterLedgers: config.FEE_BUMP_AFTER_LEDGERS,
     maxAttempts: config.FEE_BUMP_MAX_ATTEMPTS,
@@ -797,10 +801,12 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
  * so a matching non-terminal row resolves without waiting for the poll.
  */
 export async function recoverByTxHash(txHash: string, deps: RecoverDeps = {}): Promise<void> {
-  const store = deps.store ?? prismaOutboxStore();
-  const row = await store.findByAnyHash([txHash]);
-  if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
-  await recoverRow(row, { ...deps, store });
+  return withCallerClass('agent', async () => {
+    const store = deps.store ?? prismaOutboxStore();
+    const row = await store.findByAnyHash([txHash]);
+    if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
+    await recoverRow(row, { ...deps, store });
+  });
 }
 
 async function bumpRow(
@@ -847,10 +853,14 @@ async function bumpRow(
 
   // Persisted before sending, as for every submission.
   try {
-    const resp = await server.sendTransaction(outer);
+    const resp = await withCallerClass('agent', () =>
+      withTimeout('rpc-write', () => server.sendTransaction(outer)),
+    );
     if (resp.status === 'ERROR') {
       // Expected after the inner already landed; poll before deciding.
-      const recheck = await server.getTransaction(row.hash!);
+      const recheck = await withCallerClass('agent', () =>
+        withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
+      );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
         const recheckLedger = (recheck as { ledger?: number }).ledger ?? null;
         const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {

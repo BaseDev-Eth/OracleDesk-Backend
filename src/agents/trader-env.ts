@@ -343,6 +343,17 @@ export function prodTraderEnv(): TraderEnv {
           return Array.isArray(detail?.provenance) ? (detail!.provenance as ProvenanceEntry[]) : [];
         });
 
+      const citedSourceIds = [
+        ...new Set(
+          (order.forecast.ensemble?.members ?? []).flatMap((m) => {
+            const detail = m.detail as { citedSignalIds?: unknown } | undefined;
+            return Array.isArray(detail?.citedSignalIds)
+              ? (detail!.citedSignalIds.filter((x): x is string => typeof x === 'string'))
+              : [];
+          }),
+        ),
+      ];
+
       // Generate reasoning trace BEFORE executing
       const { trace, tracePayload } = await generateReasoningTrace({
         marketId:            order.marketId,

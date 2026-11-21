@@ -1,5 +1,6 @@
 import { AgentPausedError, gateCycle } from '../services/agent-controls.service';
 import { writeAgentLog } from '../lib/agent-log';
+import { withCallerClass } from '../lib/context';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { deadline } from '../lib/resilience';
@@ -26,15 +27,13 @@ export async function runTraderCycle(opts?: { signal?: AbortSignal }): Promise<{
       logger.info({ ...err.details }, 'Trader Agent: paused — skipping cycle');
       return { outcome: 'SKIPPED_PAUSED' };
     }
-    throw err;
-  }
 
-  const parentSignal = opts?.signal
-    ? opts.signal
-    : shutdownController.signal;
+    const parentSignal = opts?.signal
+      ? opts.signal
+      : shutdownController.signal;
 
-  const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
-  const signal = handle.signal;
+    const handle = deadline('rpc-write', parentSignal, config.CYCLE_DEADLINE_MS);
+    const signal = handle.signal;
 
   try {
     signal.throwIfAborted();

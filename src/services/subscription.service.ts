@@ -250,8 +250,8 @@ function isUniqueViolation(err: unknown): boolean {
 
 /** How long a request waits for the current claimant of a txHash. */
 const CLAIM_WAIT_MS = 30_000;
-/** Interactive-transaction budget: it covers one RPC verification plus writes. */
-const CLAIM_TX_TIMEOUT_MS = 60_000;
+/** Interactive-transaction budget: DB-only settlement after unlocked verification (#305). */
+export const CLAIM_LOCKED_TIMEOUT_MS = 10_000;
 
 /** The advisory-lock key that serializes claims for one transaction hash. */
 export function paymentClaimLockKey(txHash: string): string {
@@ -703,8 +703,22 @@ export async function recordPayment(params: {
   const early = await existingClaimResult(prisma, txHash, userId);
   if (early) return early;
 
-  // #59 serialises every claim for this hash. #53/#54 additionally serialise
-  // per user so allowance/stacking writes cannot interleave across hashes.
+  // Phase A (unlocked, #305): fetch immutable chain facts and evaluate against
+  // caller expectations before opening any database transaction or taking
+  // advisory locks, so RPC slowness can never pin Postgres pool connections.
+  const facts = await getTxFacts(txHash);
+  const transfer = evaluateTransfer(facts, {
+    txHash,
+    token:     CONTRACTS.usdc,
+    from:      walletAddress,
+    to:        PAYMENTS_RECIPIENT,
+    minAmount: DAILY_PASS_PRICE_RAW,
+    subId,
+    subIdKind,
+  });
+
+  // Phase B (locked, DB-only): #59 serialises every claim for this hash, and
+  // #53/#54 serialise per user so allowance and stacking writes cannot interleave.
   let claim: { acquired: true; value: ClaimResult } | { acquired: false };
   try {
     claim = await withAdvisoryLocksWait<ClaimResult>(
@@ -713,16 +727,6 @@ export async function recordPayment(params: {
         // A racer that waited may now see the committed winner.
         const existing = await existingClaimResult(tx, txHash, userId);
         if (existing) return { subscription: existing, transfer: null, replay: true };
-
-        const transfer = await verifyUsdcTransfer({
-          txHash,
-          token:     CONTRACTS.usdc,
-          from:      walletAddress,
-          to:        PAYMENTS_RECIPIENT,
-          minAmount: DAILY_PASS_PRICE_RAW,
-          subId,
-          subIdKind,
-        });
 
         const settlement = await settleVerifiedTransfer(tx, {
           userId,
@@ -733,7 +737,7 @@ export async function recordPayment(params: {
 
         return { subscription: settlement.subscription, transfer, replay: false };
       },
-      { waitMs: CLAIM_WAIT_MS, timeoutMs: CLAIM_TX_TIMEOUT_MS },
+      { waitMs: CLAIM_WAIT_MS, timeoutMs: CLAIM_LOCKED_TIMEOUT_MS },
     );
   } catch (err) {
     if (isUniqueViolation(err)) {

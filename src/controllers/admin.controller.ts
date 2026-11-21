@@ -29,6 +29,7 @@ import { acknowledgeSpecDrift, getSpecCompatHistory } from '../services/stellar/
 import { getFeeOracle } from '../services/stellar/fees';
 import { getChainCache } from '../lib/chain-cache';
 import { getLlmUsage } from '../lib/llm-budget';
+import { getBulkheadStats } from '../lib/resilience';
 import { getCronStatus } from '../cron/registry';
 import { MAX_SILENCE_MINUTES, acknowledgeIncident, listIncidents, silenceIncident } from '../services/ops-alerts/incidents';
 import { getReplicationSummary } from '../jobs/ipfs-replication.job';
@@ -342,6 +343,7 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       // Shared across instances (Redis); null when the guard store is down.
       usage: await getLlmUsage().catch(() => null),
     },
+    bulkheads: getBulkheadStats(),
     process: {
       uptimeSeconds: process.uptime(),
       memory: process.memoryUsage(),

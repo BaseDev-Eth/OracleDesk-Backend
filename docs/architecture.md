@@ -406,10 +406,10 @@ package's `node_modules` keyed on its lockfile.
 A daily pass is granted only after `payment-verification.service.ts` reads the transaction with Stellar RPC `getTransaction` and confirms all of the following:
 
 - it succeeded;
-- it is a single `transfer` on the USDC contract;
+- it emitted qualifying SAC `transfer` event(s) on the USDC contract;
 - `from` is the logged-in wallet;
 - `to` is `PAYMENTS_RECIPIENT`;
-- the amount is at least `DAILY_PASS_PRICE_RAW`.
+- the net amount (minus refunds) is at least `DAILY_PASS_PRICE_RAW`.
 
 Each hash is usable once (unique `PaymentEvent.txHash`). There is no development bypass; tests inject a fake RPC reader. Per-trace unlocks are sold by the x402 service in the contracts repo, which the frontend calls directly.
 
@@ -646,12 +646,15 @@ The trader trades where its own probability differs from the price by at least 0
 - **Cost.** At most `FORECAST_MAX_MARKETS_PER_CYCLE` (5) markets and `FORECAST_MAX_LLM_CALLS_PER_CYCLE` (10) LLM calls per cycle; candidates without a recent forecast go first, soonest close first. Results are cached in Redis under `forecast:{marketId}:{digest}` (question hash + relevant signals) for `FORECAST_CACHE_TTL_HOURS` (6). A forecast with no LLM member (budget, cap or provider failure) is not traded on.
 - **Residual risk.** A model can still read a price out of news ("traders see 70% odds"). The prompt tells it to ignore quoted odds, and the recorded adjustments show which signal moved the estimate.
 
-## Treasury-aware sizing (#76)
+## Treasury-aware sizing (#76, #299)
 
-The treasury contract enforces `max_trade` per call, cumulative `max_market` per market and a rolling `max_daily` on every agent spend. The trader sizes from the same numbers (`treasury-budget.service.ts`), read once per cycle with `available_capital()`, `get_config()` and `daily_usage()`:
+The treasury contract enforces `max_trade` per call, cumulative `max_market` per market and a rolling `max_daily` on every agent spend. `treasury-accounting.service.ts` reads the contract's authoritative views (`nav()`, `capital_breakdown()` with `liquid_capital()` fallback on trap, `daily_headroom()`, `net_exposure()`, `queue_reserved()`, and `YieldVenue` instance storage) in parallel with ledger-skew checking (`ACCOUNTING_MAX_LEDGER_SKEW`, default `1`) and single-flight caching (`ACCOUNTING_CACHE_MS`, default `15 s`, invalidated by `treasury:capital` write/event hooks including market-core `Trade` events where `trader === CONTRACTS.treasury`).
 
-- **Bankroll** = `available_capital()` (the treasury's free USDC: it includes subscription revenue paid to the treasury and excludes capital locked in markets). Kelly, the daily drawdown check and the correlated-exposure cap all use it. A failed read skips the cycle (`TREASURY_READ_FAILED`): there is no constant to fall back to.
-- **Daily headroom** = `max_daily − daily_usage().amount`. The view already rolls the window over (a window anchored at the first spend after expiry, not UTC midnight), so an expired window reads as 0 used; it resets at `day_start + 86 400`.
+`treasury-budget.service.ts` consumes `readTreasuryAccounting()` alongside `get_config()` and `daily_usage()`:
+
+- **Bankroll** = `min(spendableRaw, dailyHeadroomRaw)` where `spendableRaw = max(0, liquidRaw − queueReservedRaw)` — sourced strictly from liquid USDC net of withdrawal-queue reservations and never from share-denominated yield (falling back to `available_capital()` only when the accounting views are absent). Known contract gaps (`NAV_EXCLUDES_YIELD`, `YIELD_VALUE_IN_SHARES`, `YIELD_READ_FAILED`, `AVAILABLE_MIXES_UNITS`) are recorded in `budgetSnapshot` and `GET /portfolio`. A failed read skips the cycle (`TREASURY_READ_FAILED`): there is no constant to fall back to.
+- **Portfolio NAV** (`GET /portfolio`): `totalUsdc` uses on-chain `navRaw` when present, and `treasury` exposes `navRaw`, `spendableRaw`, and `flags`.
+- **Daily headroom** = `daily_headroom()` (or `max_daily − daily_usage().amount` on legacy contracts). The view already rolls the window over (a window anchored at the first spend after expiry, not UTC midnight), so an expired window reads as 0 used; it resets at `day_start + 86 400`.
 - **Market headroom** = `max_market −` the market's cumulative treasury spend: the latest indexed `TradeAuthorized.market_total` when present, otherwise executed trades plus the seed for agent-created markets (marked `estimated`). Sells never reduce it.
 - **Clamp.** In 7-decimal base units, before any trace exists: `final = min(kelly → correlation, max_trade, market headroom, daily headroom, available)`, with `TREASURY_HEADROOM_SAFETY_BPS` (default 5%) taken off the market and daily headroom for races with market creation and window rollover. Orders below 1 USDC are skipped. A budget older than 60 s is re-read, and each buy is debited from the cycle's copy so later orders see it.
 - **Trace.** `sizing: { kellyRaw, correlationRaw, marketExposureRaw, marketExposureEstimated, finalRaw, binding, safetyBps, budget }`, with `binding` one of `KELLY | CORRELATION | MAX_TRADE | MAX_MARKET | DAILY | AVAILABLE`.

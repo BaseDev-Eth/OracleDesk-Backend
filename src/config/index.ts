@@ -691,6 +691,11 @@ export const envObjectSchema = z
     REPORTS_ENABLED: z.enum(['true', 'false']).default('false').transform((v) => v === 'true'),
     REPORT_CRON: z.string().default('10 0 * * *'),
     REPORT_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
+    // Tolerance in 7-decimal base units before a NAV reconciliation diff forces best_effort (#299).
+    REPORT_NAV_TOLERANCE_RAW: z.string().regex(/^\d+$/, 'must be a non-negative integer').default('0'),
+    // On-chain treasury accounting cache TTL and max ledger skew across parallel views (#299).
+    ACCOUNTING_CACHE_MS: z.string().default('15000').transform(Number).pipe(z.number().int().min(100)),
+    ACCOUNTING_MAX_LEDGER_SKEW: z.string().default('1').transform(Number).pipe(z.number().int().min(0)),
 
     // ── Treasury admin console (#156) ─────────────────────────────────────
     // Lifetime of a prepared unsigned transaction.
@@ -761,6 +766,7 @@ export const envObjectSchema = z
     // ── Resilience & Timeouts ─────────────────────────────────────────────
     TIMEOUT_RPC_READ_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_WRITE_MS: z.string().default('45000').transform(Number),
+    TIMEOUT_RPC_CONFIRM_MS: z.string().default('8000').transform(Number),
     TIMEOUT_RPC_EVENTS_MS: z.string().default('15000').transform(Number),
     TIMEOUT_LLM_MS: z.string().default('60000').transform(Number),
     TIMEOUT_IPFS_PIN_MS: z.string().default('20000').transform(Number),
@@ -772,9 +778,14 @@ export const envObjectSchema = z
     BULKHEAD_IPFS: z.string().default('4').transform(Number),
     BULKHEAD_RPC_READ: z.string().default('16').transform(Number),
     BULKHEAD_RPC_WRITE: z.string().default('4').transform(Number),
+    BULKHEAD_RPC_CONFIRM: z.string().default('8').transform(Number),
     BULKHEAD_RPC_EVENTS: z.string().default('4').transform(Number),
     BULKHEAD_DATASOURCE: z.string().default('8').transform(Number),
     BULKHEAD_QUEUE: z.string().default('32').transform(Number),
+    // Proactive shedding threshold for saturated RPC bulkheads (#300)
+    RPC_SHED_AFTER_MS: z.string().default('2000').transform(Number).pipe(z.number().int().min(0)),
+    // Optional JSON overrides for per-class bulkhead policies (#300)
+    RPC_CLASS_POLICY_JSON: optionalString,
 
     // Request & cycle deadlines
     HTTP_REQUEST_TIMEOUT_MS: z.string().default('30000').transform(Number),
@@ -784,6 +795,10 @@ export const envObjectSchema = z
       z.number().refine((v) => v > 600000, { message: 'MARKET_RESERVATION_LEASE_MS must exceed CYCLE_DEADLINE_MS (600000)' }),
     ),
     IPFS_MAX_BYTES: z.string().default('2097152').transform(Number),
+
+    // ── Forecast & Citation Validation (#75, #304) ────────────────────────
+    CITATION_QUOTE_MIN_JACCARD: z.string().default('0.5').transform(Number).pipe(z.number().min(0).max(1)),
+    CITATION_MAX_INVALID_FRACTION: z.string().default('0.34').transform(Number).pipe(z.number().min(0).max(1)),
 
     // ── Trace Audit (Issue #150) ──────────────────────────────────────────
     TRACE_AUDIT_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
