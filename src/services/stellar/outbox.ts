@@ -25,6 +25,7 @@
  */
 import { Keypair, Transaction, TransactionBuilder, rpc } from '@stellar/stellar-sdk';
 import { config } from '../../config';
+import { getChainCache } from '../../lib/chain-cache';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { RedisUnavailableError, getRedis, releaseLock, renewLock } from '../../lib/redis';
@@ -44,6 +45,7 @@ export const SIGNED_GRACE_MS = 30_000;
 export interface ChainTransactionRow {
   id: string;
   kind: string;
+  opClass?: string | null;
   refId: string | null;
   contract: string | null;
   method: string | null;
@@ -176,7 +178,99 @@ export interface CompletionOutcome {
   /** Native return value for SUCCESS (e.g. the on-chain market id or shares). */
   value?: unknown;
   txHash?: string | null;
+  ledger?: number | null;
   error?: string | null;
+}
+
+// ─── Write intents & confirmation invalidation (#330) ────────────────────────
+
+const WRITE_INTENT_MARGIN_MS = 15_000;
+const rowIntents = new Map<string, string>();
+
+/** TTL for write intents: inline wait window plus a safety margin. */
+export function writeIntentTtlMs(): number {
+  return config.OUTBOX_INLINE_WAIT_MS + WRITE_INTENT_MARGIN_MS;
+}
+
+function rowArgsObject(args: unknown): Record<string, unknown> {
+  return args && typeof args === 'object' && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Registers a chain-cache write intent for an outbox row once its envelope is
+ * signed and before sendTransaction. Returns the intent token, or null when the
+ * write affects no cached tags.
+ */
+export async function beginWriteIntentForRow(
+  rowId: string,
+  method: string,
+  args: Record<string, unknown>,
+  ttlMs = writeIntentTtlMs(),
+): Promise<string | null> {
+  const tags = tagsForWrite(method, args);
+  if (tags.length === 0) return null;
+  await endWriteIntentForRow(rowId);
+  try {
+    const token = await getChainCache().beginWrite(tags, ttlMs);
+    rowIntents.set(rowId, token);
+    return token;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId, method }, 'outbox: failed to begin write intent');
+    return null;
+  }
+}
+
+/** Ends any active write intent tracked for an outbox row. Idempotent. */
+export async function endWriteIntentForRow(rowId: string): Promise<void> {
+  const token = rowIntents.get(rowId);
+  if (!token) return;
+  rowIntents.delete(rowId);
+  try {
+    await getChainCache().endWrite(token);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId }, 'outbox: failed to end write intent');
+  }
+}
+
+/** Extends the write intent while a row remains PENDING during recovery. */
+async function refreshWriteIntentForRow(row: ChainTransactionRow): Promise<void> {
+  if (!row.method) return;
+  await beginWriteIntentForRow(row.id, row.method, rowArgsObject(row.args));
+}
+
+/**
+ * Confirmation hook (#330): invalidates every chain-read cache tag affected by
+ * a confirmed write at its landing ledger, then clears the row's write intent.
+ *
+ * Called for SUCCESS and for FAILED transactions that landed on-chain with a
+ * txHash (a failed transaction still consumed fees and may have altered state
+ * via a fee-bump). Runs before `markHandled`, so a crash re-runs it safely.
+ */
+export async function onConfirmed(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+  const shouldInvalidate =
+    outcome.status === 'SUCCESS' ||
+    (outcome.status === 'FAILED' && Boolean(outcome.txHash ?? row.landedHash));
+
+  try {
+    if (shouldInvalidate && row.method) {
+      const returned = outcome.status === 'SUCCESS' ? (outcome.value ?? row.returnValue) : undefined;
+      const tags = tagsForWrite(row.method, rowArgsObject(row.args), returned);
+      const rawLedger = row.ledger ?? outcome.ledger;
+      const atLedger = typeof rawLedger === 'number' && Number.isFinite(rawLedger) && rawLedger > 0
+        ? rawLedger
+        : undefined;
+      if (tags.length > 0) {
+        const cache = getChainCache();
+        await Promise.all(tags.map((tag) => cache.invalidateTag(tag, atLedger)));
+      }
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id, method: row.method }, 'outbox: cache invalidation failed');
+  } finally {
+    await endWriteIntentForRow(row.id);
+  }
 }
 
 export type CompletionHandler = (row: ChainTransactionRow, outcome: CompletionOutcome) => Promise<void>;
@@ -192,9 +286,9 @@ export function registerHandler(kind: string, handler: CompletionHandler): void 
 }
 
 /**
- * Runs the kind's handler, then marks the row handled. The handler runs before
- * the mark on purpose: a crash in between re-runs the handler, which must be
- * idempotent; the reverse order would lose the run entirely.
+ * Runs the kind's handler, invalidates affected chain-cache tags, then marks
+ * the row handled. Running handler + invalidation before the mark guarantees
+ * a crash in between re-runs both idempotently.
  */
 export async function runCompletionHandler(
   row: ChainTransactionRow,
@@ -556,25 +650,38 @@ export async function recoverRow(
   }
 
   if (landed) {
-    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: { toXDR(enc: string): string } };
+    const anyResp = landed.resp as { ledger?: number; returnValue?: unknown; resultXdr?: string | { toXDR(enc: string): string } };
+    const resultXdrB64 = serializeResultXdr(landed.resp);
     if (landed.status === 'SUCCESS') {
       const value = parseReturnValue(row, anyResp.returnValue);
       const moved = await store.transition(row.id, [...IN_FLIGHT], 'SUCCESS', {
         landedHash: landed.hash,
         ledger: anyResp.ledger ?? null,
+        resultXdr: resultXdrB64,
         returnValue: printableValue(value) ?? undefined,
       });
+      await recordFeeReceipt(
+        moved ?? row,
+        inferOpClass(moved ?? row),
+        estimateFromRow(moved ?? row),
+        landed.resp,
+        { landedHash: landed.hash },
+      );
       if (moved) {
         await applyLandedHash(moved, landed.hash);
-        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash }, store);
+        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
     } else {
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
-      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', { landedHash: landed.hash, error });
+      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', {
+        landedHash: landed.hash,
+        ledger: anyResp.ledger ?? null,
+        error,
+      });
       if (moved) {
-        await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash }, store);
+        await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
@@ -602,12 +709,19 @@ export async function recoverRow(
     return stats;
   }
 
+  // Row is still in-flight: extend its write intent while pending (#330).
+  if (row.status === 'PENDING' || row.status === 'SUBMITTED') {
+    await refreshWriteIntentForRow(row);
+  }
+
   // Crash between sign and send: the stored envelope resubmits byte-for-byte,
   // which is safe (same hash, same sequence; at most one copy can execute).
   if (row.status === 'SIGNED' && row.envelopeXdr) {
     try {
       const signed = TransactionBuilder.fromXDR(row.envelopeXdr, config.STELLAR_NETWORK_PASSPHRASE) as Transaction;
-      const resp = await server.sendTransaction(signed);
+      const resp = await withCallerClass('agent', () =>
+        withTimeout('rpc-write', () => server.sendTransaction(signed)),
+      );
       if (resp.status === 'PENDING' || resp.status === 'DUPLICATE') {
         await store.transition(row.id, ['SIGNED'], 'SUBMITTED', { submitLedger: resp.latestLedger ?? null });
         stats.resubmitted++;
@@ -628,7 +742,9 @@ export async function recoverRow(
 
   // Submitted but not yet visible: fee-bump when stuck past the threshold (#38).
   if (!config.FEE_BUMP_ENABLED) return stats;
-  const latestLedger = deps.ledgerOverride ?? (await server.getLatestLedger()).sequence;
+  const latestLedger =
+    deps.ledgerOverride ??
+    (await withCallerClass('agent', () => withTimeout('rpc-read', () => server.getLatestLedger()))).sequence;
   if (!shouldBump(row, latestLedger, nowSecs, {
     afterLedgers: config.FEE_BUMP_AFTER_LEDGERS,
     maxAttempts: config.FEE_BUMP_MAX_ATTEMPTS,
@@ -695,10 +811,12 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
  * so a matching non-terminal row resolves without waiting for the poll.
  */
 export async function recoverByTxHash(txHash: string, deps: RecoverDeps = {}): Promise<void> {
-  const store = deps.store ?? prismaOutboxStore();
-  const row = await store.findByAnyHash([txHash]);
-  if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
-  await recoverRow(row, { ...deps, store });
+  return withCallerClass('agent', async () => {
+    const store = deps.store ?? prismaOutboxStore();
+    const row = await store.findByAnyHash([txHash]);
+    if (!row || TERMINAL_STATUSES.includes(row.status as OutboxStatus)) return;
+    await recoverRow(row, { ...deps, store });
+  });
 }
 
 async function bumpRow(
@@ -745,14 +863,27 @@ async function bumpRow(
 
   // Persisted before sending, as for every submission.
   try {
-    const resp = await server.sendTransaction(outer);
+    const resp = await withCallerClass('agent', () =>
+      withTimeout('rpc-write', () => server.sendTransaction(outer)),
+    );
     if (resp.status === 'ERROR') {
       // Expected after the inner already landed; poll before deciding.
-      const recheck = await server.getTransaction(row.hash!);
+      const recheck = await withCallerClass('agent', () =>
+        withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
+      );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
+        const recheckLedger = (recheck as { ledger?: number }).ledger ?? null;
         const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {
           landedHash: row.hash,
+          ledger: recheckLedger,
         });
+        await recordFeeReceipt(
+          moved ?? row,
+          inferOpClass(moved ?? row),
+          estimateFromRow(moved ?? row),
+          recheck,
+          { landedHash: row.hash },
+        );
         if (moved) {
           await runCompletionHandler(
             moved,
@@ -760,6 +891,7 @@ async function bumpRow(
               status: recheck.status,
               value: recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined,
               txHash: row.hash,
+              ledger: recheckLedger,
             },
             store,
           );

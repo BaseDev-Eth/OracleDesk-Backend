@@ -36,6 +36,13 @@ import { fetchIpfsBytes } from './ipfs.service';
 import { meaningfulTokens, tokenOverlap } from './market-policy';
 import { activeMap, applyMap, applyMapToInterval, identityMap, type RecalibrationMap } from './recalibration.service';
 import { partitionSignals, renderUntrustedBlock, renderUntrustedRecord, sanitizeSignal, sanitizeSignalText } from './llm-guard.service';
+import { canonicalUrl } from './signal-normalize';
+import {
+  parseFredNumeric,
+  remediateForecastSample,
+  type CitationSource,
+  type RejectedAdjustment,
+} from './citation-validator.service';
 import baseRateTable from './forecast.base-rates.json';
 import type {
   AggregatedSignal,
@@ -200,7 +207,13 @@ export function buildForecastInput(
     closeTime: market.expiryTimestamp,
     resolutionSource: market.resolutionOracle ?? null,
     questionDoc,
-    signals: signals.map((s) => ({ id: s.signalId, source: s.source, title: s.title, publishedAt: s.publishedAt })),
+    signals: signals.map((s) => ({
+      id: s.signalId,
+      source: s.source,
+      title: s.title,
+      publishedAt: s.publishedAt,
+      ...(s.url ? { url: s.url } : {}),
+    })),
     now,
   };
 }
@@ -240,10 +253,18 @@ export function buildForecastPrompt(
   fixedNonce?: string,
 ): { system: string; user: string; citations: Record<string, string | undefined> } {
   const sanitized = input.signals.map((s, i) => ({
-    ...sanitizeSignal({ source: s.source, title: s.title, content: '', publishedAt: s.publishedAt, relevanceScore: 0, category: '' }),
+    ...sanitizeSignal({
+      source: s.source,
+      title: s.title,
+      content: '',
+      publishedAt: s.publishedAt,
+      relevanceScore: 0,
+      category: '',
+      url: s.url ?? undefined,
+    }),
     id: `s${i + 1}`,
   }));
-  const { clean } = partitionSignals(sanitized);
+  const { clean, quarantined } = partitionSignals(sanitized);
   const citations = Object.fromEntries(clean.map((s) => [s.id, input.signals[Number(s.id.slice(1)) - 1]?.id]));
   const doc = input.questionDoc ? renderUntrustedRecord(input.questionDoc, 'question_document', fixedNonce, 600) : null;
   const daysToClose = Math.max(0, Math.round((input.closeTime.getTime() - input.now.getTime()) / 86_400_000));
@@ -257,7 +278,7 @@ export function buildForecastPrompt(
     questionDocBlock: doc ? `QUESTION DOCUMENT (pinned, hash-verified):\n${doc}` : 'QUESTION DOCUMENT: none available.',
     signalsBlock: clean.length > 0 ? renderUntrustedBlock(clean, 'untrusted_signals', fixedNonce) : '(no relevant signals)',
   });
-  return { system, user, citations };
+  return { system, user, citations, sent, quarantinedIds };
 }
 
 /** Per-cycle forecast budget (#75): markets forecast and LLM calls made. */
@@ -317,10 +338,73 @@ export function llmForecaster(
             task: 'forecasting',
             prompt: { id: promptDef.id, version: promptDef.version, hash: promptDef.contentHash },
           });
-          outputs.push({
-            value: result.value,
+
+          // Output-side citation validation and deterministic remediation (#304).
+          // No retry loop: the call is already counted against the session budget.
+          const rem = remediateForecastSample(result.value, sent, quarantinedIds);
+          const provenance: LlmProvenance = {
+            ...result.provenance,
+            citationCheck: rem.summary,
+          };
+          allProvenance.push(provenance);
+
+          if (!rem.accepted) {
+            logger.warn(
+              {
+                marketId: input.marketId,
+                sampleIndex: i,
+                issueCodes: rem.summary.issueCodes,
+                invalidFraction: rem.report.invalidFraction,
+              },
+              'CITATION_REJECTED: excluding forecast sample',
+            );
+            await writeAgentLog({
+              agentType: 'TRADER',
+              level: 'WARN',
+              action: 'CITATION_REJECTED',
+              data: {
+                marketId: input.marketId,
+                sampleIndex: i,
+                checked: rem.summary.checked,
+                issueCodes: rem.summary.issueCodes,
+                invalidFraction: rem.report.invalidFraction,
+                signalHashes,
+              },
+            }).catch(() => {});
+            continue;
+          }
+
+          if (rem.action === 'STRIPPED') {
+            logger.info(
+              {
+                marketId: input.marketId,
+                sampleIndex: i,
+                issueCodes: rem.summary.issueCodes,
+                rejectedAdjustments: rem.rejectedAdjustments.length,
+              },
+              'CITATION_STRIPPED: remediated forecast citations',
+            );
+            await writeAgentLog({
+              agentType: 'TRADER',
+              level: 'INFO',
+              action: 'CITATION_STRIPPED',
+              data: {
+                marketId: input.marketId,
+                sampleIndex: i,
+                checked: rem.summary.checked,
+                issueCodes: rem.summary.issueCodes,
+                rejectedAdjustments: rem.rejectedAdjustments.length,
+                signalHashes,
+              },
+            }).catch(() => {});
+          }
+
+          accepted.push({
+            value: rem.sanitized,
             model: `${result.provider}:${result.model}`,
-            provenance: result.provenance,
+            provenance,
+            rejectedAdjustments: rem.rejectedAdjustments,
+            citedSignalIds: rem.citedSignalIds,
           });
         } catch (err) {
           if (err instanceof LlmBudgetExceeded) {
@@ -330,35 +414,39 @@ export function llmForecaster(
           logger.warn({ marketId: input.marketId, err: (err as Error)?.message?.slice(0, 200) }, 'Forecast LLM call failed');
         }
       }
-      if (outputs.length === 0) return null;
+      if (accepted.length === 0) return null;
 
-      const ps = outputs.map((o) => clampP(o.value.p));
+      const ps = accepted.map((o) => clampP(o.value.p));
       const p = median(ps);
-      const iqrSigma = median(outputs.map((o) => Math.max(0, o.value.p_high_50 - o.value.p_low_50) / NORMAL_IQR));
+      const iqrSigma = median(accepted.map((o) => Math.max(0, o.value.p_high_50 - o.value.p_low_50) / NORMAL_IQR));
       const mean = ps.reduce((a, b) => a + b, 0) / ps.length;
       const sampleVar = ps.length > 1 ? ps.reduce((acc, x) => acc + (x - mean) ** 2, 0) / (ps.length - 1) : 0;
       const sigma = Math.max(SIGMA_FLOOR, Math.sqrt(iqrSigma ** 2 + sampleVar));
-      const first = outputs[0].value;
+      // Published rationale and adjustments come from the first accepted sample (#304).
+      const first = accepted[0];
       return {
-        model: `llm:${outputs[0].model}`,
+        model: `llm:${first.model}`,
         p,
         sigma,
-        rationale: first.rationale,
+        rationale: first.value.rationale,
         inputsDigest: sha256Hex(canonicalJson({
           prompt: { id: promptDef.id, version: promptDef.version, hash: promptDef.contentHash },
           input: forecastInputDigest(input),
         })),
         detail: {
-          baseRate: first.base_rate,
+          baseRate: first.value.base_rate,
           // Prompt ids (s1…) mapped back to signal-store ids.
-          adjustments: first.adjustments.map((a) => ({ ...a, signalId: citations[a.signal_id] ?? null })),
-          interval50: [first.p_low_50, first.p_high_50],
-          samples: outputs.length,
-          // The full provenance of each forecast call (#235), so attribution
-          // and trader-trace provenance can report the forecast prompt and
-          // provider, not just the hedge-conditions call.
-          provenance: outputs.map((o) => o.provenance),
-          ...(outputs.length > 1 ? { sampleP: ps } : {}),
+          adjustments: first.value.adjustments.map((a) => ({ ...a, signalId: citations[a.signal_id] ?? null })),
+          citedSignalIds: first.citedSignalIds,
+          ...(first.rejectedAdjustments.length > 0 ? { rejectedAdjustments: first.rejectedAdjustments } : {}),
+          citationCheck: first.provenance.citationCheck,
+          interval50: [first.value.p_low_50, first.value.p_high_50],
+          samples: accepted.length,
+          // The full provenance of each forecast call (#235, #304), so attribution
+          // and trader-trace provenance report the forecast prompt, provider,
+          // and citation-check summary.
+          provenance: allProvenance,
+          ...(accepted.length > 1 ? { sampleP: ps } : {}),
         },
       };
     },
