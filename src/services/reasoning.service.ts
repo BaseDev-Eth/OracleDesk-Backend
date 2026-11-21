@@ -59,9 +59,7 @@ export async function generateReasoningTrace(
   // canonicalJson would encode differently from the contracts repo.
   const provenance = buildTraceProvenance([...(opts.upstreamProvenance ?? []), hedgeConditions.provenance]);
 
-  const traceId = crypto.randomUUID();
   const tracePayload: Record<string, unknown> = {
-    traceId,
     agentType:           input.agentType,
     decisionType:        input.decisionType,
     marketId:            input.marketId,
@@ -92,11 +90,8 @@ export async function generateReasoningTrace(
     signal: s.signal,
   }));
 
-  // create, not upsert: a collision on a fresh UUID must fail loudly rather
-  // than hand back a stale row.
   const trace = await prisma.reasoningTrace.create({
     data: {
-      id:                  traceId,
       marketId:            input.marketId,
       agentType:           input.agentType,
       decisionType:        input.decisionType,
@@ -119,7 +114,7 @@ export async function generateReasoningTrace(
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, tracePayload };
+  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
 }
 
 /**

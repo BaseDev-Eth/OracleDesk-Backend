@@ -37,10 +37,11 @@ import {
   triggerReconciliationRun,
   triggerTraceAuditRun,
   voidDisputeTx,
-  listMoneyAuditRuns,
-  listMoneyAuditFindings,
-  triggerMoneyAuditRun,
-  ackMoneyAuditFinding,
+  listChainTransactions,
+  getChainTransaction,
+  recoverChainTransaction,
+  rerunChainTransactionHandler,
+  abandonChainTransaction,
 } from '../controllers/admin.controller';
 
 const router = Router();
@@ -95,11 +96,13 @@ router.get('/chain/spec-compat', requirePermission('admin.read'), getSpecCompat)
 router.get('/chain/signing-keys', requirePermission('chain.signing_keys'), requireStepUp, getChainSigningKeys);
 router.post('/chain/signing-keys/register', requirePermission('chain.signing_keys'), requireStepUp, registerChainSigningKey);
 router.post('/chain/signing-keys/:publicKey/retire', requirePermission('chain.signing_keys'), requireStepUp, retireChainSigningKey);
-// Operational alerts (#226). Guarded and audited by requirePermission; there is
-// deliberately no unguarded copy of these in the section below.
-router.get('/alerts', requirePermission('admin.read'), getAlerts);
-router.post('/alerts/:id/ack', requirePermission('alerts.manage'), ackAlert);
-router.post('/alerts/:id/silence', requirePermission('alerts.manage'), silenceAlert);
+// Admin outbox console (#221). The actions write their own audit row (outbox
+// id, kind, from/to status, reason, hashes), so they opt out of the generic one.
+router.get('/chain/transactions', requirePermission('chain.outbox.read'), listChainTransactions);
+router.get('/chain/transactions/:id', requirePermission('chain.outbox.read'), getChainTransaction);
+router.post('/chain/transactions/:id/recover', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, recoverChainTransaction);
+router.post('/chain/transactions/:id/rerun-handler', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, rerunChainTransactionHandler);
+router.post('/chain/transactions/:id/abandon', requirePermission('chain.outbox.operate', { audit: false }), requireStepUp, abandonChainTransaction);
 router.get('/treasury', getTreasury);
 router.get('/treasury/operations', listTreasuryOperations);
 router.post('/treasury/operations', createOperation);

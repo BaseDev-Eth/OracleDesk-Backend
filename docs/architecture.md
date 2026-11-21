@@ -413,18 +413,16 @@ A daily pass is granted only after `payment-verification.service.ts` reads the t
 
 Each hash is usable once (unique `PaymentEvent.txHash`). There is no development bypass; tests inject a fake RPC reader. Per-trace unlocks are sold by the x402 service in the contracts repo, which the frontend calls directly.
 
-## Money representation (#224)
+### Spending allowances: the ledger-day rule (#219)
 
-Payment and allowance money is an integer count of USDC base units (7 decimals), stored as `NUMERIC(39,0)` (or digits-only `TEXT` for `payment_events.amountRaw`) and handled as `bigint` via `src/lib/amounts.ts`: `parseUsdc` (decimal string → base units, rejects exponents and an 8th decimal), `formatUsdc` (base units → display string), `decimalToBigint` (Prisma `Decimal` → `bigint` without a JS number). The exact columns are the only source of truth: `subscriptions.amountPaidRaw`, `payment_events.amountRaw`, `spending_allowances.dailyLimitRaw` / `perTraceLimitRaw` / `spentTodayRaw` / `overageRaw`.
+Allowances (#53) are charged per UTC day, and **the day is the UTC day of the transfer's ledger close time** (`ledgerDay(ledgerCloseAt)` in `src/lib/time.ts`), the same instant pass windows are anchored to (#54). It is never the day the claim or confirmation happens to run: a transfer that closed at 23:59:50 and is claimed (or confirmed by `confirmPendingPaymentIntents`) at 00:00:10 is charged to the previous day, and the new day's budget is untouched. When the RPC response has no `createdAt`, `chargeDayFor` falls back to the current time and the charge is marked `dayInferred`.
 
-- **Responses.** `toSubscriptionDto`, `toPaymentEventDto` and `toAllowanceDto` in `subscription.service.ts` list their fields explicitly and return each amount as a base-unit string plus a `formatUsdc` display string; a Prisma row is never sent as is, so a Float (or a `Decimal`) cannot leak. Express serialises any `bigint` as a decimal string.
-- **Input.** `PUT /traces/access/allowance` takes base-unit strings or decimal strings; JSON numbers are converted with `parseUsdc(String(n))` for one deprecated release. `usdcFromNumber` is only for legacy float sources and is never trusted on its own: the raw backfill uses it as a candidate compared against the chain.
-- **Float mirrors.** `subscriptions.amountPaid`, `payment_events.amount` and `spending_allowances.dailyLimit` / `perTraceLimit` / `spentToday` are leftovers of #55 being written alongside the exact columns. Nothing reads them. They are removed in three phases so that instances of adjacent releases stay correct during a rolling deploy:
-  1. **Expand** (`20261120020000_payments_raw_expand`): adds `amountPaidRaw` (NOT VALID non-negative CHECK), gives every float `DEFAULT 0`, creates `payment_raw_backfill`. Settlement dual-writes `amountPaidRaw`; `npm run backfill:payment-raw` fills legacy NULLs, verifying each against the on-chain SAC transfer where RPC still has it.
-  2. **Switch** (same release, `PAYMENT_FLOAT_WRITES`): readers, DTOs, snapshots, audits and seeds use raw values only. With `PAYMENT_FLOAT_WRITES=false` writers omit the floats and the defaults apply; an older instance only ever sees `0` in a column it does not read.
-  3. **Contract** (`prisma/migrations-pending/20261120030000_payments_float_contract`): drops the floats and validates the CHECK. It is breaking by design and ships later under `migration:breaking`.
-
-The procedure, preconditions and rollback are in `docs/runbooks/payments-float-contract.md`. Trading and market tables (`Trade`, `Position`, `CopyTrade`, `Market`) still carry floats and are out of scope here.
+- **Buckets.** `allowance_days` holds one row per `(userId, day)` with `spentRaw` (booked within the limit), `reservedRaw` (held by open x402 reservations) and `overageRaw`. `remaining = max(dailyLimitRaw − spentRaw − reservedRaw, 0)`. A late claim for day D only ever touches D's row, and every charge is a durable `allowance_charges` row, unique by `txHash`, so charging is idempotent and auditable per day. `spending_allowances.spentTodayRaw` / `spentToday` / `windowStartedAt` are deprecated mirrors, written only for charges whose day is the current UTC day; `spending_allowances.overageRaw` stays the lifetime total.
+- **Charging.** `settleVerifiedTransfer` calls `chargeAllowance` with `source` `PASS_CLAIM` or `PAYMENT_INTENT`. Over-limit amounts are accepted (the chain already moved the money): `min(amount, remaining)` is booked and the excess is flagged as overage on that day, in the lifetime counter and on the `PaymentEvent`.
+- **x402.** Per-trace purchases go through the HMAC-authenticated `reserve → commit | release` API (`docs/api.md`). A reservation holds budget on the day it was made; `commit` returns the hold and books the settled amount on the ledger-close day, which can be the next day. A commit for an expired, released or unknown reservation is still booked, with overage flagged. Reservations never make a pass claim fail; they only shrink the remaining budget. The payment-intent cron expires reservations past `expiresAt` in batches with `FOR UPDATE SKIP LOCKED`.
+- **Preauthorization** (`POST /traces/access/preauthorize`, `GET /traces/access/allowance`) reads today's bucket and reports `dayStart`. A payment signed just before midnight can close after it: the check is against today, the charge lands on tomorrow, which is correct.
+- **Locking.** Every writer for a user and day serialises on the bucket's row lock (`INSERT … ON CONFLICT DO NOTHING`, then `SELECT … FOR UPDATE`), because the x402 endpoints do not take the per-user advisory lock that pass claims hold. Lock order everywhere is: the `allowance_charges` row (commit, release, sweep), then buckets by ascending day, then `spending_allowances`.
+- **Backfill.** Migration `20261120120000_allowance_day_buckets` turned confirmed `DAILY_PASS`/`PER_TRACE` payment events into `COMMITTED` charges on `COALESCE(ledgerCloseTime, confirmedAt, createdAt)::date` (`dayInferred` where the close time was missing), copying stored overage without recomputing it, and summed them into buckets. Unapplied payment-intent transfers (`metadata.noCoverage`) were never charged and are not backfilled.
 
 ## Position valuation (#78)
 
@@ -703,6 +701,16 @@ The runner only issues `findMany` (events up to `--to`, because pools are rebuil
 
 `/livez` checks only the process; `/readyz` probes Postgres, Redis, RPC and the indexer lag. `HEALTH_CRITICAL` decides which failures return 503. By default Redis and Postgres are critical (login and every data endpoint need them) and RPC is not: an instance without RPC stays ready and keeps serving database reads, while on-chain state, resolution, trace and payment endpoints return 502. The indexer fails when it is more than `INDEXER_MAX_LAG_LEDGERS` behind or its cursor is older than `INDEXER_MAX_STALENESS_MS`; with no cursor yet it reports `initialising`. On SIGTERM `/readyz` returns 503 `draining` for `SHUTDOWN_DRAIN_MS` before the server stops accepting connections.
 
+### Chain-write readiness (#220)
+
+None of the dependency probes says whether an instance can still land chain writes, so three more probes exist: `outbox` (backlog by status, oldest in-flight age, rows past `maxTime`, oldest unhandled terminal row, per-kind completion-handler failure streaks), `signers` (agent and, with `FEE_BUMP_ENABLED`, fee-payer native balance and runway) and `channels` (channel-pool health). They can be listed in `HEALTH_CRITICAL`, but they only count on a **writer**: `HEALTH_CHAIN_WRITER=auto` resolves to live mode and the outbox worker running in this process (`PROCESS_ROLE` `all` or `worker`, #272). On API-only pods and in dry-run they report `{ writer: false }` without querying and are never critical, so a dry fee payer cannot take the API out of rotation.
+
+Results are tri-state. Degraded (half a backlog/age threshold, runway under `HEALTH_BALANCE_MIN_RUNWAY_HOURS`, some channels unhealthy) keeps the pod ready and turns `/readyz` into `200 degraded`; failing on a critical probe returns 503.
+
+Cost: `/readyz` is polled every `HEALTH_CACHE_TTL_MS`. The outbox probe is one grouped query over `chain_transactions WHERE "handledAt" IS NULL`, an index-only scan of the partial covering index `chain_transactions_unhandled_idx` (probe timeouts do not cancel a Prisma query, so it must stay cheap). Balances come from `getAccountEntry` (bigint stroops, never floats) through a snapshot cached for `HEALTH_BALANCE_TTL_MS` with a single-flight refresh; while the `rpc` probe is failing the last snapshot is returned `stale` and no RPC call is made. Agent spend is `sum(COALESCE(fee_charged, total_fee))` from `chain_fees` over 24 h (channel-sourced writes are included, so the agent runway is conservative when channels are configured); fee-payer spend is the bid fee of every bump built in the window. Channel balances are read by the pool's balance monitor (`ChannelPool.checkBalances`, started in live mode wherever the outbox worker runs), which takes channels under `CHANNEL_MIN_BALANCE_XLM` out of rotation; an unchecked channel counts as healthy. Handler streaks are per instance; the oldest-unhandled age is the cluster-wide signal.
+
+**Restart-loop safety.** `/livez` never runs any of these probes. A writer pod that becomes unready (dry fee payer, stuck backlog) is taken out of traffic but is not restarted: restarting cannot fund an account, and the outbox worker keeps resolving rows meanwhile. Full detail is in `GET /admin/status` under `chainWrites`.
+
 ## Generated code
 
 `src/generated/` is copied from the pinned `contracts` submodule by `scripts/sync-contracts.mjs`, with a do-not-edit header and `// @ts-nocheck`. CI fails if it's stale.
@@ -751,6 +759,25 @@ OpenAI-compatible). They normalise SDK errors into `LlmError.kind`
 
 Text mode never sets a JSON response format; only `mode: "json"` does.
 
+**Structured calls follow the same policy (#218).** `callLLMStructured` walks
+`policies[task]` in order and uses each spec's provider, model, temperature and
+`maxTokens` (the request is capped at `min(opts.maxTokens ?? 2048,
+spec.maxTokens)`, as in the router). Provider health lives in one
+`ProviderHealthBook` (`router.healthBook`) shared by both paths: a provider the
+router has cooling or open is skipped by structured calls, and structured
+transport failures (5xx, timeouts, rate limits, quotas) cool providers for
+free-form calls too. Validation failures fall back to the next spec but never
+touch provider health. With the default policies the request bodies for
+`market_generation`, `hedge_conditions` and `forecasting` are unchanged.
+`dispute_review` structured calls now honour the policy's **Gemini-first**
+order (#92) at temperature 0; before #218 they went to Anthropic first at 0.2.
+If every configured spec is cooling or open, the call fails with `503
+LLM_UNAVAILABLE` saying so.
+
+OpenAI-compatible specs (`provider: "openai"`) are supported on both paths and
+take a lease on the shared guards like the other providers
+(`LLM_OPENAI_RPM`, default 15).
+
 ## Structured LLM output (#65)
 
 Output that must fit a shape (market proposals, hedge conditions) is never
@@ -768,26 +795,53 @@ must contain the probability, expiry must be in the future) are `postValidate`
 functions whose message goes into the repair turn.
 
 `callLLMStructured(spec, { system, user }, { maxTokens, ctx, task })` returns
-`{ value, provider, model, attempts }`:
+`{ value, provider, model, attempts }`. Providers are tried in the task's
+policy order (see "LLM router" above); each is a structured adapter in
+`src/lib/llm/structured/`:
 
 1. **Anthropic**: `tools: [{ name, description, input_schema }]` with a forced
    `tool_choice`; the `tool_use` block is searched for (a text block may come
    first). `stop_reason: "max_tokens"` is never repaired at the same budget: the
-   budget is doubled once, then the call fails with a specific reason.
-2. **Gemini**: `responseMimeType: "application/json"` plus `responseSchema`;
-   the text is `JSON.parse`d with no fence stripping.
-3. Each provider gets **one repair round**: the zod issues (or the `postValidate`
+   budget is doubled once (never past 16 384 or twice the spec's `maxTokens`),
+   then the call fails with a specific reason.
+2. **Gemini**: `responseMimeType: "application/json"` plus `responseSchema`,
+   with the spec's model (not the `GEMINI_MODEL` constant); the text is
+   `JSON.parse`d with no fence stripping.
+3. **OpenAI** (#218): `response_format: { type: "json_schema", json_schema: {
+   name, schema: spec.openaiSchema, strict: true } }`. `toOpenAIStrictSchema`
+   closes every object (`additionalProperties: false`), lists every property in
+   `required` and turns optional ones into `anyOf: [X, { type: "null" }]`; the
+   adapter deletes those nulls again before zod, so `price_asset: null` means
+   "absent". Only a small keyword allowlist reaches OpenAI (`type`,
+   `description`, `properties`, `required`, `additionalProperties`, `items`,
+   `enum`, `anyOf`; `const` becomes a one-value `enum`): bounds such as
+   `minimum`, `maxItems` or `pattern` are dropped because strict-mode support
+   for them varies by model, and zod re-checks them. A schema strict mode
+   cannot express (a free-form map, a non-object root) throws at module load.
+   For servers that reject `response_format`, `jsonMode: "prompt"` sends no
+   response format and appends the JSON Schema to the system prompt instead. A
+   `message.refusal` is a validation failure (`model refused`), and
+   `finish_reason: "length"` raises the budget once like Anthropic.
+4. Each provider gets **one repair round**: the zod issues (or the `postValidate`
    message) go back as an `is_error` `tool_result` (Anthropic) or a correction
-   turn (Gemini). Anthropic that still fails falls back to Gemini.
-4. Failure is `AppError(422, "LLM_STRUCTURED_OUTPUT_FAILED", { provider, issues })`
-   when output never validated, otherwise the last transport/guard error.
+   turn (Gemini, OpenAI). A provider that still fails falls back to the next
+   spec in the policy.
+5. Failure is `AppError(422, "LLM_STRUCTURED_OUTPUT_FAILED", { provider, issues })`
+   when output never validated, otherwise the last transport/guard error,
+   otherwise `503 LLM_UNAVAILABLE` (nothing configured, or everything cooling).
+   Provenance records the evaluated chain in `route: { task, chain: [{ provider,
+   model, decision }] }`, where `decision` is `served`, an error class
+   (`validation`, `server_error`, ...), `unconfigured`, `cooling` or `open`;
+   categories only, never provider messages. `fallbackFrom` is the first chain
+   entry that was attempted and failed.
    `INVALID_LLM_JSON`, `SCHEMA_VALIDATION_FAILED` and
    `INVALID_CONFIDENCE_INTERVAL` remain on the `validateMarketQuestion()` wrapper.
 
 Every attempt, repairs included, takes a lease on the shared guards below. Prompts
 and outputs are not logged at info; counts and provider/model are. `callLLMText`
 falls back to a plain-text Gemini call (never a JSON one). Tests replace the
-providers through `setAnthropicClient()` / `setGeminiModelFactory()` and replay the
+providers through `setAnthropicClient()` / `setGeminiModelFactory()` /
+`setOpenAIClient()` and replay the
 shapes in `tests/fixtures/llm/` (hand-built examples of the API shapes, not
 captures from a live account).
 
@@ -1167,7 +1221,7 @@ to source-weight learning.
 replaces the per-process interval guards and circuit breaker. Every provider
 attempt is `acquire()` → call → `record()`:
 
-- **Token bucket** per provider (`LLM_ANTHROPIC_RPM`, `LLM_GEMINI_RPM`, capacity =
+- **Token bucket** per provider (`LLM_ANTHROPIC_RPM`, `LLM_GEMINI_RPM`, `LLM_OPENAI_RPM`, capacity =
   RPM). An empty bucket makes `acquire` wait with jitter for up to 30 s.
 - **Circuit breaker** per provider: `closed → open → half-open`. A daily quota error
   opens it (Gemini: until at least the next UTC midnight); `LLM_BREAKER_FAILURE_THRESHOLD`

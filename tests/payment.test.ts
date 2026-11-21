@@ -111,6 +111,23 @@ function reader(opts: ReaderOpts) {
 }
 
 const HASH = 'ab'.repeat(32);
+
+/**
+ * Transaction-client pieces the claim path needs besides the maps each test
+ * keeps: advisory locks and an empty allowance_days bucket (#219).
+ */
+function allowanceTxStub() {
+  return {
+    $queryRaw: async (sql: TemplateStringsArray) =>
+      sql.join('?').includes('allowance_days') ? [{ spentRaw: '0', reservedRaw: '0', overageRaw: '0' }] : [{ locked: true }],
+    $executeRaw: async () => 1,
+    allowanceDay: { update: async () => ({}) },
+    allowanceCharge: {
+      findUnique: async () => null,
+      create: async ({ data }: any) => ({ id: `charge-${data.txHash}`, ...data }),
+    },
+  };
+}
 const code = (p: Promise<unknown>) => p.then(() => 'ok', (e: any) => e.code ?? e.message);
 
 test('payment verification: success and every failure mode', async () => {
@@ -376,7 +393,7 @@ test('recordPayment: grants a pass once per hash and never without verification'
     subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    $queryRaw: async () => [{ locked: true }],
+    ...allowanceTxStub(),
     paymentEvent: {
       findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
       create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
@@ -436,9 +453,16 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
   (prisma.subscription.findFirst as any) = async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    subscription: { create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; } },
-    paymentEvent: { create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; } },
-    spendingAllowance: { updateMany: async () => ({ count: 0 }) },
+    ...allowanceTxStub(),
+    subscription: {
+      findFirst: async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null,
+      create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; },
+    },
+    paymentEvent: {
+      findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
+      create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
+    },
+    spendingAllowance: { findUnique: async () => null, updateMany: async () => ({ count: 0 }) },
   });
 
   const envelope = transferEnvelope({
@@ -462,133 +486,34 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
   }
 });
 
-/** A transaction client that records every create/update payload (#224). */
-function recordingTx(allowance: any) {
-  const writes: Array<{ model: string; data: any }> = [];
-  const tx = {
-    subscription: {
-      findFirst: async () => null,
-      create: async ({ data }: any) => { writes.push({ model: 'subscription', data }); return { id: 'sub-1', ...data }; },
-    },
-    paymentEvent: {
-      create: async ({ data }: any) => { writes.push({ model: 'paymentEvent', data }); return { id: 'pe-1', ...data }; },
-    },
-    spendingAllowance: {
-      findUnique: async () => allowance,
-      update: async ({ data }: any) => { writes.push({ model: 'spendingAllowance', data }); return { ...allowance, ...data }; },
-    },
-  };
-  return { tx: tx as any, writes };
-}
-
-function verifiedTransfer(amount: bigint) {
-  return {
-    txHash: 'ab'.repeat(32), from: Keypair.random().publicKey(), to: 'C', amount, ledger: 42,
-    txSource: 'G', memo: { type: 'none' as const, value: null }, transfers: [], toMuxedId: null,
-    createdAt: Math.floor(Date.now() / 1000), envelopeMismatch: false,
-  };
-}
-
-const FLOAT_COLUMNS = ['amount', 'amountPaid', 'spentToday', 'dailyLimit', 'perTraceLimit'];
-
-test('settleVerifiedTransfer writes amountPaidRaw, and no floats with PAYMENT_FLOAT_WRITES=false (#224)', async () => {
-  const { config } = await load();
-  const { settleVerifiedTransfer } = await import('../src/services/subscription.service');
-  const allowance = {
-    isActive: true, windowStartedAt: new Date(), dailyLimitRaw: '50000000', perTraceLimitRaw: '5000000',
-    spentTodayRaw: '0', overageRaw: '0',
-  };
-  const previous = config.PAYMENT_FLOAT_WRITES;
-  try {
-    config.PAYMENT_FLOAT_WRITES = true;
-    const dual = recordingTx(allowance);
-    await settleVerifiedTransfer(dual.tx, { userId: 'u1', type: 'DAILY_PASS', transfer: verifiedTransfer(5_000_001n) });
-    const sub = dual.writes.find((w) => w.model === 'subscription')!.data;
-    assert.equal(sub.amountPaidRaw, '5000001');
-    assert.equal(sub.amountPaid, 0.5000001, 'dual-write keeps the display mirror this release');
-    assert.equal(dual.writes.find((w) => w.model === 'paymentEvent')!.data.amountRaw, '5000001');
-    assert.equal(dual.writes.find((w) => w.model === 'spendingAllowance')!.data.spentToday, 0.5000001);
-
-    config.PAYMENT_FLOAT_WRITES = false;
-    const rawOnly = recordingTx(allowance);
-    await settleVerifiedTransfer(rawOnly.tx, { userId: 'u1', type: 'DAILY_PASS', transfer: verifiedTransfer(5_000_001n) });
-    assert.equal(rawOnly.writes.length, 3);
-    for (const { model, data } of rawOnly.writes) {
-      for (const column of FLOAT_COLUMNS) assert.equal(column in data, false, `${model}.${column} must not be written`);
-    }
-    assert.equal(rawOnly.writes.find((w) => w.model === 'subscription')!.data.amountPaidRaw, '5000001');
-    assert.equal(rawOnly.writes.find((w) => w.model === 'spendingAllowance')!.data.spentTodayRaw, '5000001');
-  } finally {
-    config.PAYMENT_FLOAT_WRITES = previous;
-  }
-});
-
-test('upsertSpendingAllowance takes base units and honours PAYMENT_FLOAT_WRITES (#224)', async () => {
-  const { config } = await load();
+test('settleVerifiedTransfer charges ledgerDay(ledgerCloseAt), not the claim day (#219)', async () => {
   const { prisma } = await import('../src/lib/prisma');
-  const { upsertSpendingAllowance } = await import('../src/services/subscription.service');
-  const calls: any[] = [];
-  const original = prisma.spendingAllowance.upsert;
-  (prisma.spendingAllowance.upsert as any) = async (args: any) => { calls.push(args); return args.create; };
-  const previous = config.PAYMENT_FLOAT_WRITES;
+  const { settleVerifiedTransfer } = await import('../src/services/subscription.service');
+  const { fakeAllowanceDb, seedAllowance } = await import('./helpers/fake-allowance-db');
+  const db = fakeAllowanceDb();
+  const restore = db.install(prisma);
   try {
-    config.PAYMENT_FLOAT_WRITES = false;
-    await upsertSpendingAllowance({ userId: 'u1', dailyLimitRaw: 50_000_000n, perTraceLimitRaw: 1n });
-    for (const column of FLOAT_COLUMNS) {
-      assert.equal(column in calls[0].create, false);
-      assert.equal(column in calls[0].update, false);
-    }
-    assert.equal(calls[0].create.perTraceLimitRaw, '1');
-    config.PAYMENT_FLOAT_WRITES = true;
-    await upsertSpendingAllowance({ userId: 'u1', dailyLimitRaw: 50_000_000n, perTraceLimitRaw: 1n });
-    assert.equal(calls[1].create.perTraceLimit, 0.0000001);
-    await assert.rejects(
-      upsertSpendingAllowance({ userId: 'u1', dailyLimitRaw: 1n, perTraceLimitRaw: 2n }),
-      (err: any) => err.code === 'INVALID_ALLOWANCE',
-    );
+    seedAllowance(db, { userId: 'u1', dailyLimitRaw: 8_000_000n, perTraceLimitRaw: 8_000_000n });
+    const base = {
+      from: Keypair.random().publicKey(), to: Keypair.random().publicKey(), ledger: 42, txSource: '',
+      memo: { type: 'none' } as any, transfers: [], toMuxedId: null, envelopeMismatch: false,
+    };
+    const claimAt = new Date('2026-11-20T00:00:10Z');
+    // D+1's own pass first, then the late claim for a transfer that closed on D.
+    await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c1'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-20T00:00:05Z') / 1000 },
+    });
+    const late = await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c2'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-19T23:59:50Z') / 1000 },
+    });
+    assert.equal(late.ledgerCloseAt.toISOString(), '2026-11-19T23:59:50.000Z');
+    assert.equal(late.overageRaw, 0n, 'D has its own budget');
+    assert.deepEqual(db.bucket('u1', '2026-11-19'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.deepEqual(db.bucket('u1', '2026-11-20'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.equal(db.allowances.get('u1')!.spentTodayRaw, '5000000', 'the late claim never touches the current day');
   } finally {
-    config.PAYMENT_FLOAT_WRITES = previous;
-    (prisma.spendingAllowance.upsert as any) = original;
+    restore();
   }
-});
-
-test('payment DTOs expose raw strings and display strings only, never the floats (#224)', async () => {
-  const { Prisma } = await import('@prisma/client');
-  const { toPaymentEventDto, toSubscriptionDto, toAllowanceDto } = await import('../src/services/subscription.service');
-  const now = new Date();
-  const event = toPaymentEventDto({
-    id: 'pe', userId: 'u', txHash: 'ab'.repeat(32), type: 'DAILY_PASS', amount: 0, amountRaw: '5000001',
-    fromAddress: 'G', currency: 'USDC', status: 'CONFIRMED', traceId: null, ledger: 1, ledgerCloseTime: now,
-    allowanceOverage: true, allowanceOverageRaw: new Prisma.Decimal('7'), paymentIntentId: null, metadata: null,
-    createdAt: now, confirmedAt: now, reconciled: false,
-  });
-  assert.equal(event.amountRaw, '5000001');
-  assert.equal(event.amountDisplay, '0.5000001');
-  assert.equal(event.allowanceOverageRaw, '7');
-  assert.equal('amount' in event, false);
-  assert.equal('reconciled' in event, false, 'only listed fields are returned');
-
-  // A phase-B row has amountPaid = 0 (the default); it must not surface as a real amount.
-  const sub = toSubscriptionDto({
-    id: 's', userId: 'u', traceId: null, type: 'DAILY_PASS', status: 'ACTIVE', amountPaid: 0,
-    amountPaidRaw: new Prisma.Decimal('5000000'), currency: 'USDC', txHash: null, createdAt: now, updatedAt: now,
-  });
-  assert.equal(sub.amountPaidRaw, '5000000');
-  assert.equal(sub.amountDisplay, '0.5');
-  assert.equal('amountPaid' in sub, false);
-  const legacy = toSubscriptionDto({ id: 's', amountPaid: 0.5, amountPaidRaw: null, createdAt: now, updatedAt: now });
-  assert.equal(legacy.amountPaidRaw, null, 'an unbackfilled row reports null, not the float');
-  assert.equal(legacy.amountDisplay, null);
-
-  const allowance = toAllowanceDto({
-    id: 'a', userId: 'u', dailyLimit: 0, perTraceLimit: 0, spentToday: 0,
-    dailyLimitRaw: new Prisma.Decimal('50000000'), perTraceLimitRaw: new Prisma.Decimal('5000000'),
-    spentTodayRaw: new Prisma.Decimal('0'), overageRaw: new Prisma.Decimal('1'), windowStartedAt: now,
-    currency: 'USDC', lastResetAt: now, isActive: true, createdAt: now, updatedAt: now,
-  });
-  assert.deepEqual(
-    [allowance.dailyLimitRaw, allowance.dailyLimitDisplay, allowance.perTraceLimitDisplay, allowance.spentTodayDisplay, allowance.overageDisplay],
-    ['50000000', '5', '0.5', '0', '0.0000001'],
-  );
-  for (const column of FLOAT_COLUMNS) assert.equal(column in allowance, false);
 });

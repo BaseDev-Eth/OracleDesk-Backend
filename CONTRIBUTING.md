@@ -201,8 +201,9 @@ node --test --test-global-setup=dist-tests/tests/integration/global-setup.js \
 
 The agent-cycle tests (`tests/agents-cycle.test.ts`) run `runMarketMakerCycle()`
 and `runTraderCycle()` end to end without a network. Every Anthropic, Gemini,
-NewsAPI, FRED and GDELT request goes through a transport seam
-(`setAnthropicTransport`, `setGeminiTransport`, `setSignalHttp`) and is served
+OpenAI, NewsAPI, FRED and GDELT request goes through a transport seam
+(`setAnthropicTransport`, `setGeminiTransport`, `setOpenAITransport`,
+`setSignalHttp`) and is served
 from a cassette in `tests/cassettes/`. The library is `tests/helpers/cassettes.ts`.
 
 `CASSETTE_MODE` selects the mode:
@@ -241,7 +242,7 @@ file `"synthetic": true`. The committed cassettes are all synthetic for now;
 replace them with live recordings when you have keys.
 
 Before a cassette is written, the secret guard scans it for the configured key
-values and key-shaped strings (`sk-ant-…`, `AIza…`, 32-hex values in key
+values and key-shaped strings (`sk-ant-…`, OpenAI `sk-…`/`sk-proj-…`, `AIza…`, 32-hex values in key
 fields) and refuses to write it. `tests/cassettes-secrets.test.ts` runs the
 same scan over every committed cassette on every `npm test`. NewsAPI article
 text is third-party content: the recorder keeps only the six articles the

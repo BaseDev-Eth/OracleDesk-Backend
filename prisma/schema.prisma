@@ -242,7 +242,8 @@ model User {
   x402Settlements X402Settlement[]
   premiumDevices PremiumDevice[]
   premiumUsageDaily PremiumUsageDaily[]
-  receipts      Receipt[]
+  allowanceDays    AllowanceDay[]
+  allowanceCharges AllowanceCharge[]
 
   @@index([walletAddress])
   @@map("users")
@@ -1046,6 +1047,7 @@ model PaymentEvent {
   refund Refund?
 
   @@index([userId])
+  @@index([txHash])
   @@map("payment_events")
 }
 
@@ -1115,15 +1117,19 @@ model SpendingAllowance {
   /// CHECK: spending_allowances_per_trace_limit_nonneg (perTraceLimit >= 0)
   perTraceLimit Float              @default(0)
   /// CHECK: spending_allowances_spent_today_nonneg (spentToday >= 0)
+  /// Deprecated (#219): display mirror of spentTodayRaw; see below.
   spentToday    Float              @default(0)
   /// Exact base-unit accounting (#53). The Float columns above are display
   /// mirrors; limits and spend are never enforced from them.
   dailyLimitRaw    Decimal          @default(0) @db.Decimal(39, 0)
   perTraceLimitRaw Decimal          @default(0) @db.Decimal(39, 0)
+  /// Deprecated (#219): per-day spend lives in allowance_days. Still written,
+  /// but only for charges whose ledger day is the current UTC day.
   spentTodayRaw    Decimal          @default(0) @db.Decimal(39, 0)
-  /// Amount accepted while already at the limit; never silently discarded.
+  /// Lifetime amount accepted while already at the limit; never silently
+  /// discarded. allowance_days.overageRaw holds the per-day split (#219).
   overageRaw       Decimal          @default(0) @db.Decimal(39, 0)
-  /// UTC day the raw counters belong to.
+  /// Deprecated (#219): UTC day spentTodayRaw belongs to.
   windowStartedAt  DateTime         @default(now())
   currency      SettlementCurrency @default(USDC)
   lastResetAt   DateTime           @default(now())
@@ -1138,25 +1144,67 @@ model SpendingAllowance {
   @@map("spending_allowances")
 }
 
-/// Per-row outcome of scripts/backfill-payment-raw.ts (#224). Keyed by the
-/// source table and row id, so reruns overwrite instead of duplicating.
-/// status: VERIFIED | FLOAT_ONLY | MISMATCH | NOT_FOUND (CHECK constraint).
-model PaymentRawBackfill {
-  table      String
-  rowId      String
-  /// Where rawValue came from: CHAIN, FLOAT, PAYMENT_EVENT or BACKFILL.
-  source     String
-  floatValue Float?
-  rawValue   Decimal?  @db.Decimal(39, 0)
-  chainValue Decimal?  @db.Decimal(39, 0)
-  status     String
-  detail     String?
-  /// Whether rawValue was written to the source row.
-  applied    Boolean   @default(false)
-  checkedAt  DateTime  @default(now()) @db.Timestamptz(3)
+/// Per-user, per-UTC-day allowance bucket (#219). A charge lands on the UTC
+/// day of its transfer's ledger close time, not the day it was claimed, so a
+/// late claim never touches the following day. The row lock on a bucket
+/// serialises every writer for that user and day (pass claims, payment
+/// intents, x402 reserve/commit/release and the expiry sweep). Lock order:
+/// allowance_charges row, then buckets by ascending day, then
+/// spending_allowances.
+model AllowanceDay {
+  userId      String
+  day         DateTime @db.Date
+  /// CHECK: allowance_days_amounts_nonneg (spentRaw, reservedRaw, overageRaw >= 0)
+  /// Booked within the daily limit (never above it while a limit is active).
+  spentRaw    Decimal  @default(0) @db.Decimal(39, 0)
+  /// Held by open x402 reservations made on this day.
+  reservedRaw Decimal  @default(0) @db.Decimal(39, 0)
+  /// Accepted beyond the daily limit on this day (#53 semantics).
+  overageRaw  Decimal  @default(0) @db.Decimal(39, 0)
+  updatedAt   DateTime @updatedAt
 
-  @@id([table, rowId])
-  @@map("payment_raw_backfill")
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, day])
+  @@map("allowance_days")
+}
+
+/// One durable row per allowance charge or x402 reservation (#219).
+/// RESERVED rows hold budget in allowance_days.reservedRaw until committed,
+/// released or expired by the sweep. `reservationKey` is the reserve
+/// idempotency key (`<payer identityKey>|<nonce>`), unique so a retried
+/// reserve returns the same reservation.
+model AllowanceCharge {
+  id               String    @id @default(uuid())
+  userId           String
+  /// Ledger-close UTC day once COMMITTED; the reservation day while RESERVED.
+  day              DateTime  @db.Date
+  /// CHECK: allowance_charges_source_values (source IN ('PASS_CLAIM','PAYMENT_INTENT','X402'))
+  /// PASS_CLAIM | PAYMENT_INTENT | X402
+  source           String
+  /// CHECK: allowance_charges_status_values (status IN ('RESERVED','COMMITTED','RELEASED','EXPIRED'))
+  /// CHECK: allowance_charges_reserved_expiry (status <> 'RESERVED' OR expiresAt IS NOT NULL)
+  /// RESERVED | COMMITTED | RELEASED | EXPIRED
+  status           String
+  /// CHECK: allowance_charges_tx_hash_format (txHash IS NULL OR 64 hex chars)
+  txHash           String?   @unique
+  reservationKey   String?   @unique
+  traceId          String?
+  /// CHECK: allowance_charges_amounts_nonneg (amountRaw >= 0 AND overageRaw >= 0)
+  amountRaw        Decimal   @db.Decimal(39, 0)
+  overageRaw       Decimal   @default(0) @db.Decimal(39, 0)
+  perTraceExceeded Boolean   @default(false)
+  /// The day came from the wall clock because the close time was unknown.
+  dayInferred      Boolean   @default(false)
+  expiresAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @default(now()) @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, day])
+  @@index([status, expiresAt])
+  @@map("allowance_charges")
 }
 
 // ─────────────────────────── PRICING SCHEDULE ───────────────────────────

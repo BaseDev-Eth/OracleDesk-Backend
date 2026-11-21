@@ -22,7 +22,7 @@ import { sendError } from '../utils/response.util';
 import { logger } from '../lib/logger';
 import { config } from '../config';
 import { secret } from '../config/secrets';
-import { health } from '../services/health.service';
+import { chainWritesStatus, health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
 import { agentSigner } from '../services/stellar/clients';
 import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
@@ -65,6 +65,8 @@ import {
   recordSubmitted,
   submitOperation,
 } from '../services/treasury-ops.service';
+import { outboxActionSchema, outboxIdSchema, outboxListQuerySchema } from '../validators/admin.validator';
+import { abandon, listOutbox, outboxDetail, recoverNow, rerunHandler } from '../services/outbox-admin.service';
 
 function actor(req: Request): string {
   if (!req.user) throw new AppError(401, 'UNAUTHORIZED', 'Authentication required');
@@ -320,6 +322,8 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       agentPublicKey: agentSigner().publicKey ?? null,
       preflight: 'not_implemented',
     },
+    // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
+    chainWrites: await chainWritesStatus().catch(() => null),
     llm: {
       anthropicConfigured: secret('ANTHROPIC_API_KEY') !== '',
       geminiConfigured: secret('GEMINI_API_KEY') !== '',
@@ -550,35 +554,52 @@ export async function voidDisputeTx(req: Request, res: Response): Promise<void> 
   sendSuccess(res, await buildGuardianTx(disputeId(req), 'guardian_void_market'));
 }
 
-// ─── Learned source weights (#223) ───────────────────────────────────────────
+// ─── Admin outbox console (#221) ─────────────────────────────────────────
 
-function weightSetId(req: Request): string {
-  const id = String(req.params.id ?? '').trim();
-  if (!id || id.length > 64) throw new AppError(400, 'VALIDATION_ERROR', 'Invalid weight set id');
-  return id;
+function outboxId(req: Request): string {
+  const parsed = outboxIdSchema.safeParse(String(req.params.id ?? ''));
+  if (!parsed.success) throw new AppError(400, 'VALIDATION_ERROR', 'id must be a chain transaction UUID');
+  return parsed.data;
 }
 
-/** GET /admin/source-weights — every set, newest version first. */
-export async function listSourceWeightSets(_req: Request, res: Response): Promise<void> {
-  sendSuccess(res, await sourceWeights.listWeightSets());
+function outboxReason(req: Request): string {
+  const parsed = outboxActionSchema.safeParse(req.body ?? {});
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'reason is required (10-500 characters)', parsed.error.flatten().fieldErrors as any);
+  }
+  return parsed.data.reason;
 }
 
-/** GET /admin/source-weights/:id — the set and its per-key diff against the active set. */
-export async function getSourceWeightSet(req: Request, res: Response): Promise<void> {
-  sendSuccess(res, await sourceWeights.getWeightSetWithDiff(weightSetId(req)));
+/** GET /admin/chain/transactions — outbox rows, newest first, with filters. */
+export async function listChainTransactions(req: Request, res: Response): Promise<void> {
+  const parsed = outboxListQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    throw new AppError(400, 'VALIDATION_ERROR', 'Invalid outbox filter', parsed.error.flatten().fieldErrors as any);
+  }
+  const { page, limit } = parsePagination(req.query as any);
+  const { rows, total } = await listOutbox({ ...parsed.data, page, limit });
+  sendSuccess(res, rows, 200, buildPaginationMeta(page, limit, total) as any);
 }
 
-/** POST /admin/source-weights/:id/approve — a second admin approves a DRAFT (step-up). */
-export async function approveSourceWeightSet(req: Request, res: Response): Promise<void> {
-  sendSuccess(res, await sourceWeights.approveWeightSet(weightSetId(req), actor(req)));
+/** GET /admin/chain/transactions/:id — decoded envelope, fee bumps, RPC status, linked rows. */
+export async function getChainTransaction(req: Request, res: Response): Promise<void> {
+  sendSuccess(res, await outboxDetail(outboxId(req)));
 }
 
-/** POST /admin/source-weights/:id/activate — retire the active set, activate this one (step-up). */
-export async function activateSourceWeightSet(req: Request, res: Response): Promise<void> {
-  sendSuccess(res, await sourceWeights.activateWeightSet(weightSetId(req), actor(req)));
+/** POST /admin/chain/transactions/:id/recover — one recovery pass for this row now. */
+export async function recoverChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await recoverNow(id, actor(req), outboxReason(req)));
 }
 
-/** POST /admin/source-weights/rollback — reactivate the previously active set (step-up). */
-export async function rollbackSourceWeightSet(req: Request, res: Response): Promise<void> {
-  sendSuccess(res, await sourceWeights.rollbackWeightSet(actor(req)));
+/** POST /admin/chain/transactions/:id/rerun-handler — terminal rows only. */
+export async function rerunChainTransactionHandler(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await rerunHandler(id, actor(req), outboxReason(req)));
+}
+
+/** POST /admin/chain/transactions/:id/abandon — only when the envelope provably cannot land. */
+export async function abandonChainTransaction(req: Request, res: Response): Promise<void> {
+  const id = outboxId(req);
+  sendSuccess(res, await abandon(id, actor(req), outboxReason(req)));
 }

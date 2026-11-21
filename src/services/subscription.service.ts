@@ -19,7 +19,7 @@ import { AppError } from '../middlewares/error.middleware';
 import type { SubscriptionAccess } from '../types';
 import { summarizeProvenance } from '../lib/llm/provenance';
 import { withAdvisoryLocksWait } from '../lib/advisory-lock';
-import { DAY_MS, ledgerCloseDate, utcDayStart } from '../lib/time';
+import { DAY_MS, chargeDayFor, ledgerCloseDate, ledgerDay, utcDayKey, utcDayStart } from '../lib/time';
 import { notifyUser } from '../lib/socket-auth';
 import { discoverTracePrice } from './x402-discovery.service';
 
@@ -294,41 +294,125 @@ export interface Preauthorization {
   active: boolean;
   allowed: boolean;
   reason: 'ALLOWANCE_PER_TRACE_LIMIT' | 'ALLOWANCE_DAILY_LIMIT' | null;
+  /**
+   * The UTC day checked (today). A transfer is charged to the UTC day its
+   * ledger closes, which can be the next day for a payment signed just
+   * before midnight (#219).
+   */
+  dayStart: string;
   dailyLimitRaw: string | null;
   perTraceLimitRaw: string | null;
   spentTodayRaw: string;
+  /** Budget held by open x402 reservations today. */
+  reservedRaw: string;
   remainingRaw: string | null;
   overageRaw: string;
   wouldOverflowRaw: string;
 }
 
-/** Advisory-only allowance check. Never writes or reserves budget (#53). */
+/** Where an allowance charge came from (#219). */
+export type AllowanceSource = 'PASS_CLAIM' | 'PAYMENT_INTENT' | 'X402';
+
+export interface AllowanceBucket {
+  spentRaw: bigint;
+  reservedRaw: bigint;
+  overageRaw: bigint;
+}
+
+type AllowanceDb = Prisma.TransactionClient | typeof prisma;
+
+/** Reads the (userId, day) bucket without locking; zeros when absent. */
+async function readAllowanceDay(db: AllowanceDb, userId: string, day: Date): Promise<AllowanceBucket> {
+  const row = await db.allowanceDay.findUnique({ where: { userId_day: { userId, day } } });
+  return {
+    spentRaw: row ? decimalToBigint(row.spentRaw) : 0n,
+    reservedRaw: row ? decimalToBigint(row.reservedRaw) : 0n,
+    overageRaw: row ? decimalToBigint(row.overageRaw) : 0n,
+  };
+}
+
+/**
+ * Creates the (userId, day) bucket if needed and takes its row lock for the
+ * rest of the transaction (#219). This lock, not the per-user advisory lock,
+ * is what serialises pass claims with the x402 endpoints. Lock order
+ * everywhere: allowance_charges row, buckets by ascending day, then
+ * spending_allowances.
+ */
+export async function lockAllowanceDay(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  day: Date,
+): Promise<AllowanceBucket> {
+  const key = utcDayKey(day);
+  await tx.$executeRaw`
+    INSERT INTO "allowance_days" ("userId", "day", "updatedAt")
+    VALUES (${userId}, ${key}::date, CURRENT_TIMESTAMP)
+    ON CONFLICT ("userId", "day") DO NOTHING`;
+  const rows = await tx.$queryRaw<Array<{ spentRaw: Prisma.Decimal; reservedRaw: Prisma.Decimal; overageRaw: Prisma.Decimal }>>`
+    SELECT "spentRaw", "reservedRaw", "overageRaw"
+    FROM "allowance_days"
+    WHERE "userId" = ${userId} AND "day" = ${key}::date
+    FOR UPDATE`;
+  const row = rows[0];
+  if (!row) throw new Error(`allowance_days row for ${userId}/${key} vanished under lock`);
+  return {
+    spentRaw: decimalToBigint(row.spentRaw),
+    reservedRaw: decimalToBigint(row.reservedRaw),
+    overageRaw: decimalToBigint(row.overageRaw),
+  };
+}
+
+/** Writes a locked bucket back. Callers must hold its row lock. */
+export async function writeAllowanceDay(
+  tx: Prisma.TransactionClient,
+  userId: string,
+  day: Date,
+  bucket: AllowanceBucket,
+): Promise<void> {
+  await tx.allowanceDay.update({
+    where: { userId_day: { userId, day: utcDayStart(day) } },
+    data: {
+      spentRaw: bucket.spentRaw.toString(),
+      reservedRaw: bucket.reservedRaw.toString(),
+      overageRaw: bucket.overageRaw.toString(),
+    },
+  });
+}
+
+/** Remaining daily budget once spend and open reservations are counted. */
+export function remainingFor(dailyLimit: bigint, bucket: AllowanceBucket): bigint {
+  const used = bucket.spentRaw + bucket.reservedRaw;
+  return dailyLimit > used ? dailyLimit - used : 0n;
+}
+
+/** Allowance check against today's bucket. Never writes or reserves budget (#53, #219). */
 export async function preauthorizeSpending(
   userId: string,
   type: 'PER_TRACE' | 'DAILY_PASS',
   amountRaw: bigint,
   now = new Date(),
 ): Promise<Preauthorization> {
+  const dayStart = utcDayStart(now);
   const allowance = await prisma.spendingAllowance.findUnique({ where: { userId } });
   if (!allowance?.isActive) {
     return {
       active: false,
       allowed: true,
       reason: null,
+      dayStart: dayStart.toISOString(),
       dailyLimitRaw: null,
       perTraceLimitRaw: null,
       spentTodayRaw: '0',
+      reservedRaw: '0',
       remainingRaw: null,
       overageRaw: '0',
       wouldOverflowRaw: '0',
     };
   }
-  const dayStart = utcDayStart(now);
-  const reset = allowance.windowStartedAt < dayStart;
+  const bucket = await readAllowanceDay(prisma, userId, dayStart);
   const dailyLimit = decimalToBigint(allowance.dailyLimitRaw);
   const perTraceLimit = decimalToBigint(allowance.perTraceLimitRaw);
-  const spent = reset ? 0n : decimalToBigint(allowance.spentTodayRaw);
-  const remaining = dailyLimit > spent ? dailyLimit - spent : 0n;
+  const remaining = remainingFor(dailyLimit, bucket);
   const perTraceExceeded = type === 'PER_TRACE' && perTraceLimit > 0n && amountRaw > perTraceLimit;
   const dailyExceeded = dailyLimit > 0n && amountRaw > remaining;
   const reason = perTraceExceeded
@@ -340,62 +424,135 @@ export async function preauthorizeSpending(
     active: true,
     allowed: reason === null,
     reason,
+    dayStart: dayStart.toISOString(),
     dailyLimitRaw: dailyLimit.toString(),
     perTraceLimitRaw: perTraceLimit.toString(),
-    spentTodayRaw: spent.toString(),
+    spentTodayRaw: bucket.spentRaw.toString(),
+    reservedRaw: bucket.reservedRaw.toString(),
     remainingRaw: remaining.toString(),
     overageRaw: decimalToBigint(allowance.overageRaw).toString(),
-    wouldOverflowRaw: (amountRaw > remaining ? amountRaw - remaining : 0n).toString(),
+    wouldOverflowRaw: (dailyLimit > 0n && amountRaw > remaining ? amountRaw - remaining : 0n).toString(),
   };
 }
 
+export interface ChargeParams {
+  userId: string;
+  type: 'PER_TRACE' | 'DAILY_PASS';
+  amountRaw: bigint;
+  /** Ledger-close UTC day of the transfer (ledgerDay / chargeDayFor). */
+  day: Date;
+  source: AllowanceSource;
+  txHash?: string | null;
+  traceId?: string | null;
+  /** The day came from the wall clock because the close time was unknown. */
+  dayInferred?: boolean;
+  /** Convert this existing row (an x402 reservation) instead of inserting one. */
+  chargeId?: string | null;
+  now?: Date;
+}
+
+export interface ChargeResult {
+  chargeId: string;
+  day: Date;
+  overageRaw: bigint;
+  perTraceExceeded: boolean;
+  /** The txHash was already charged; the stored result is returned. */
+  replay: boolean;
+}
+
 /**
- * Applies the exact amount to the raw allowance counters inside the payment
- * transaction. Over-limit payments are accepted (the chain already moved the
- * money) and flagged, never rejected or silently dropped (#53).
+ * Books a settled transfer against the bucket for its ledger-close day
+ * (#219). Over-limit amounts are accepted (the chain already moved the money)
+ * and flagged as overage on that day and in the lifetime counter, never
+ * rejected (#53). Idempotent per txHash: a second charge for the same hash
+ * returns the stored result without touching any counter. Runs inside the
+ * caller's transaction.
  */
-async function applyAllowance(
-  tx: Prisma.TransactionClient,
-  userId: string,
-  type: 'PER_TRACE' | 'DAILY_PASS',
-  amountRaw: bigint,
-  now: Date,
-): Promise<{ overageRaw: bigint; perTraceExceeded: boolean }> {
-  const allowance = await tx.spendingAllowance.findUnique({ where: { userId } });
-  if (!allowance?.isActive) return { overageRaw: 0n, perTraceExceeded: false };
+export async function chargeAllowance(tx: Prisma.TransactionClient, params: ChargeParams): Promise<ChargeResult> {
+  const { userId, type, amountRaw, source } = params;
+  const now = params.now ?? new Date();
+  const day = ledgerDay(params.day);
+  const txHash = params.txHash ? params.txHash.toLowerCase() : null;
 
-  const dayStart = utcDayStart(now);
-  const reset = allowance.windowStartedAt < dayStart;
-  const dailyLimit = decimalToBigint(allowance.dailyLimitRaw);
-  const perTraceLimit = decimalToBigint(allowance.perTraceLimitRaw);
-  const spent = reset ? 0n : decimalToBigint(allowance.spentTodayRaw);
-  const previousOverage = decimalToBigint(allowance.overageRaw);
+  const bucket = await lockAllowanceDay(tx, userId, day);
 
-  let newSpent = spent;
-  let newOverage = previousOverage;
-  if (dailyLimit > 0n) {
-    const remaining = dailyLimit > spent ? dailyLimit - spent : 0n;
-    if (amountRaw > remaining) {
-      newSpent = dailyLimit;
-      newOverage += amountRaw - remaining;
-    } else {
-      newSpent = spent + amountRaw;
+  // Same user + hash always lands on the same bucket, so this read is
+  // serialised by the lock above. A different user's claim of the hash fails
+  // on the unique index and aborts that transaction instead.
+  if (txHash) {
+    const existing = await tx.allowanceCharge.findUnique({ where: { txHash } });
+    if (existing && existing.status === 'COMMITTED') {
+      return {
+        chargeId: existing.id,
+        day: existing.day,
+        overageRaw: decimalToBigint(existing.overageRaw),
+        perTraceExceeded: existing.perTraceExceeded,
+        replay: true,
+      };
     }
-  } else {
-    newSpent = spent + amountRaw;
   }
 
+  const allowance = await tx.spendingAllowance.findUnique({ where: { userId } });
+  const active = Boolean(allowance?.isActive);
+  const dailyLimit = active && allowance ? decimalToBigint(allowance.dailyLimitRaw) : 0n;
+  const perTraceLimit = active && allowance ? decimalToBigint(allowance.perTraceLimitRaw) : 0n;
+
+  let booked = amountRaw;
+  let excess = 0n;
+  if (dailyLimit > 0n) {
+    const remaining = remainingFor(dailyLimit, bucket);
+    booked = amountRaw < remaining ? amountRaw : remaining;
+    excess = amountRaw - booked;
+  }
   const perTraceExceeded = type === 'PER_TRACE' && perTraceLimit > 0n && amountRaw > perTraceLimit;
-  await tx.spendingAllowance.update({
-    where: { userId },
-    data: {
-      spentTodayRaw: newSpent.toString(),
-      ...floatMirror({ spentToday: toDisplayUsdc(newSpent) }),
-      overageRaw: newOverage.toString(),
-      ...(reset ? { windowStartedAt: dayStart, lastResetAt: now } : {}),
-    },
+
+  const data = {
+    day,
+    source,
+    status: 'COMMITTED',
+    txHash,
+    traceId: params.traceId ?? null,
+    amountRaw: amountRaw.toString(),
+    overageRaw: excess.toString(),
+    perTraceExceeded,
+    dayInferred: params.dayInferred ?? false,
+    expiresAt: null,
+  };
+  const charge = params.chargeId
+    ? await tx.allowanceCharge.update({ where: { id: params.chargeId }, data })
+    : await tx.allowanceCharge.create({ data: { userId, ...data } });
+
+  const spent = bucket.spentRaw + booked;
+  await writeAllowanceDay(tx, userId, day, {
+    spentRaw: spent,
+    reservedRaw: bucket.reservedRaw,
+    overageRaw: bucket.overageRaw + excess,
   });
-  return { overageRaw: newOverage - previousOverage, perTraceExceeded };
+
+  if (allowance) {
+    // Deprecated single-day mirror: only a charge for the current UTC day may
+    // move it, so a late claim for yesterday never resets today's counter.
+    const today = utcDayStart(now);
+    const isToday = day.getTime() === today.getTime();
+    if (excess > 0n || isToday) {
+      await tx.spendingAllowance.update({
+        where: { userId },
+        data: {
+          ...(excess > 0n ? { overageRaw: { increment: excess.toString() } } : {}),
+          ...(isToday
+            ? {
+                spentTodayRaw: spent.toString(),
+                spentToday: toDisplayUsdc(spent),
+                windowStartedAt: today,
+                ...(allowance.windowStartedAt < today ? { lastResetAt: now } : {}),
+              }
+            : {}),
+        },
+      });
+    }
+  }
+
+  return { chargeId: charge.id, day, overageRaw: excess, perTraceExceeded, replay: false };
 }
 
 export interface SettlementResult {
@@ -448,7 +605,21 @@ export async function settleVerifiedTransfer(
   const endsAt = new Date(startsAt.getTime() + DAY_MS);
   const granted = endsAt > now;
   const amountRaw = transfer.amount;
-  const allowance = await applyAllowance(tx, userId, type, amountRaw, now);
+  const amount = toDisplayUsdc(amountRaw);
+  // Charge the ledger-close day, not the claim day (#219): a transfer that
+  // closed at 23:59:50 and is claimed after midnight belongs to yesterday.
+  const charge = chargeDayFor(transfer, now);
+  const allowance = await chargeAllowance(tx, {
+    userId,
+    type,
+    amountRaw,
+    day: charge.day,
+    source: paymentIntentId ? 'PAYMENT_INTENT' : 'PASS_CLAIM',
+    txHash,
+    traceId: traceId ?? null,
+    dayInferred: charge.inferred,
+    now,
+  });
 
   const created = await tx.subscription.create({
     data: {
@@ -494,6 +665,8 @@ export async function settleVerifiedTransfer(
         granted,
         allowanceOverageRaw: allowance.overageRaw.toString(),
         perTraceExceeded: allowance.perTraceExceeded,
+        allowanceDay: utcDayKey(allowance.day),
+        allowanceDayInferred: charge.inferred,
       } as any,
     },
   });
@@ -811,9 +984,27 @@ export async function upsertSpendingAllowance(params: {
   });
 }
 
-export async function getSpendingAllowance(userId: string): Promise<AllowanceDto | null> {
+/**
+ * The user's allowance with today's figures read from the day bucket (#219).
+ * spentTodayRaw/spentToday come from allowance_days, not the deprecated
+ * single-day columns, and reservedRaw is the budget held by open x402
+ * reservations.
+ */
+export async function getSpendingAllowance(userId: string, now = new Date()): Promise<any> {
   const allowance = await prisma.spendingAllowance.findUnique({ where: { userId } });
-  return allowance ? toAllowanceDto(allowance) : null;
+  if (!allowance) return null;
+  const dayStart = utcDayStart(now);
+  const bucket = await readAllowanceDay(prisma, userId, dayStart);
+  const dailyLimit = decimalToBigint(allowance.dailyLimitRaw);
+  return {
+    ...allowance,
+    dayStart: dayStart.toISOString(),
+    spentTodayRaw: bucket.spentRaw.toString(),
+    spentToday: toDisplayUsdc(bucket.spentRaw),
+    reservedRaw: bucket.reservedRaw.toString(),
+    todayOverageRaw: bucket.overageRaw.toString(),
+    remainingRaw: dailyLimit > 0n ? remainingFor(dailyLimit, bucket).toString() : null,
+  };
 }
 
 export async function listPaymentEvents(userId: string): Promise<PaymentEventDto[]> {

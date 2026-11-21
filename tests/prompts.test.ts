@@ -81,6 +81,7 @@ async function harness() {
     cleanup() {
       llm.setAnthropicClient(null);
       llm.setGeminiModelFactory(null);
+      llm.llmRouter.healthBook.reset(); // shared with completeLLM (#218)
       budget.setLlmGuardStore(prevStore);
       budget.setLlmGuardSettings({});
     },
@@ -131,7 +132,7 @@ test('anthropic success records provider, model, prompt hash, usage and outputSh
   h.llm.setAnthropicClient(a.client);
   try {
     const { sha256Hex, canonicalJson } = await import('../src/utils/hash.util');
-    const r = await h.llm.callLLMStructured(h.schema.marketProposalSpec, PROMPTS, { maxTokens: 4096, prompt: REF });
+    const r = await h.llm.callLLMStructured(h.schema.marketProposalSpec, PROMPTS, { maxTokens: 4096, task: 'market_generation', prompt: REF });
     const p = r.provenance;
     assert.equal(p.source, 'llm');
     assert.equal(p.provider, 'anthropic');

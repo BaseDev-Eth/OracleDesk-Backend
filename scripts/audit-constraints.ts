@@ -234,6 +234,45 @@ export const CONSTRAINT_CHECKS: ConstraintCheck[] = [
     severity: 'repairable',
   },
 
+  // Allowance day buckets and charges (#219)
+  {
+    name: 'allowance_days_amounts_nonneg',
+    table: 'allowance_days',
+    violation: '"spentRaw" < 0 OR "reservedRaw" < 0 OR "overageRaw" < 0',
+    severity: 'manual',
+  },
+  {
+    name: 'allowance_charges_amounts_nonneg',
+    table: 'allowance_charges',
+    violation: '"amountRaw" < 0 OR "overageRaw" < 0',
+    severity: 'manual',
+  },
+  {
+    name: 'allowance_charges_status_values',
+    table: 'allowance_charges',
+    violation: '"status" NOT IN (\'RESERVED\', \'COMMITTED\', \'RELEASED\', \'EXPIRED\')',
+    severity: 'manual',
+  },
+  {
+    name: 'allowance_charges_source_values',
+    table: 'allowance_charges',
+    violation: '"source" NOT IN (\'PASS_CLAIM\', \'PAYMENT_INTENT\', \'X402\')',
+    severity: 'manual',
+  },
+  {
+    name: 'allowance_charges_reserved_expiry',
+    table: 'allowance_charges',
+    violation: '"status" = \'RESERVED\' AND "expiresAt" IS NULL',
+    severity: 'manual',
+  },
+  {
+    name: 'allowance_charges_tx_hash_format',
+    table: 'allowance_charges',
+    violation: '"txHash" IS NOT NULL AND "txHash" !~ \'^[0-9a-f]{64}$\'',
+    fix: 'UPDATE "allowance_charges" SET "txHash" = lower(regexp_replace("txHash", \'^0x\', \'\')) WHERE "txHash" IS NOT NULL AND lower(regexp_replace("txHash", \'^0x\', \'\')) ~ \'^[0-9a-f]{64}$\'',
+    severity: 'repairable',
+  },
+
   // Uniqueness
   {
     name: 'subscriptions_txhash_unique',

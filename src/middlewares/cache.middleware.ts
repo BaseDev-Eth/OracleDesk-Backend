@@ -1,5 +1,7 @@
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import { sha256Hex, canonicalJson } from '../utils/hash.util';
+import { checkAccess } from '../services/subscription.service';
+import { checkETagMatch } from '../utils/etag.util';
 
 export type CachePolicy =
   | { kind: 'immutable'; maxAge: number }
@@ -9,12 +11,7 @@ export type CachePolicy =
 
 const POLICY_VERSION = 'v1';
 
-export function checkETagMatch(ifNoneMatch: string, etag: string): boolean {
-  if (ifNoneMatch.trim() === '*') return true;
-  const targetClean = etag.replace(/^W\//, '').trim();
-  const list = ifNoneMatch.split(',').map((s) => s.trim().replace(/^W\//, ''));
-  return list.includes(targetClean);
-}
+export { checkETagMatch };
 
 export async function authClass(req: Request): Promise<string> {
   const user = (req as any).user;

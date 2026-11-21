@@ -307,57 +307,111 @@ test('GET /portfolio derives capital from the treasury and serialises raw amount
   }
 });
 
-test('PUT /traces/access/allowance stores exact base units; numbers are deprecated (#224)', async () => {
-  const { prisma } = await import('../src/lib/prisma');
+test('admin outbox console: chain.outbox.* permissions, step-up and one audit row per action (#221)', async () => {
   const { signToken } = await import('../src/middlewares/auth.middleware');
-  const orig = { user: prisma.user.upsert, allowance: prisma.spendingAllowance.upsert };
-  const stored: any[] = [];
-  (prisma.user.upsert as any) = async () => ({});
-  (prisma.spendingAllowance.upsert as any) = async ({ create }: any) => {
-    stored.push(create);
-    const now = new Date();
-    return { id: 'a1', isActive: true, lastResetAt: now, createdAt: now, updatedAt: now, dailyLimit: 0, perTraceLimit: 0, spentToday: 0, ...create };
+  const { prisma } = await import('../src/lib/prisma');
+  const outbox = await import('../src/services/stellar/outbox');
+  const { FakeRedis } = await import('./helpers/fake-redis');
+
+  const reader = Keypair.random().publicKey();
+  const operator = Keypair.random().publicKey();
+  const outsider = Keypair.random().publicKey();
+  const roles: Record<string, { roleName: string; permissions: string[] }> = {
+    [reader]: { roleName: 'auditor', permissions: ['admin.read', 'chain.outbox.read'] },
+    [operator]: { roleName: 'operator', permissions: ['admin.read', 'chain.outbox.read', 'chain.outbox.operate'] },
+    [outsider]: { roleName: 'auditor', permissions: ['admin.read', 'admin.audit.read'] },
   };
-  const token = signToken('u-allowance', Keypair.random().publicKey());
-  const put = (body: unknown, base: string) => fetch(`${base}/api/v1/traces/access/allowance`, {
-    method: 'PUT',
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const id = crypto.randomUUID();
+  const row: Record<string, unknown> = {
+    id, kind: 'test.console', refId: null, status: 'FAILED', hash: 'ab'.repeat(32), feeBumpHashes: [],
+    landedHash: null, returnValue: null, error: 'boom', handledAt: new Date(1_000), updatedAt: new Date(0),
+  };
+  const audits: Array<{ data: Record<string, any> }> = [];
+  const orig = {
+    role: prisma.adminRoleAssignment.findUnique,
+    audit: prisma.adminAuditLog.create,
+    chainTransaction: (prisma as any).chainTransaction,
+  };
+  (prisma.adminRoleAssignment.findUnique as any) = async ({ where }: { where: { walletAddress: string } }) => {
+    const r = roles[where.walletAddress];
+    return r ? { roleName: r.roleName, role: { permissions: r.permissions.map((permissionKey) => ({ permissionKey })) } } : null;
+  };
+  (prisma.adminAuditLog.create as any) = async (args: { data: Record<string, any> }) => {
+    audits.push(args);
+    return args.data;
+  };
+  (prisma as any).chainTransaction = {
+    findUnique: async ({ where }: { where: { id: string } }) => (where.id === id ? { ...row } : null),
+    updateMany: async ({ where, data }: { where: Record<string, any>; data: Record<string, unknown> }) => {
+      if (where.id !== id) return { count: 0 };
+      if ('handledAt' in where) {
+        const current = row.handledAt as Date | null;
+        const matches = where.handledAt === null ? current === null : current?.getTime() === where.handledAt.getTime();
+        if (!matches) return { count: 0 };
+      }
+      Object.assign(row, data);
+      return { count: 1 };
+    },
+  };
+  outbox.setRowLeaseRedisForTest(new FakeRedis() as never);
+
+  const fresh = (wallet: string) => signToken(`u-${wallet.slice(0, 6)}`, wallet);
+  const stale = (wallet: string) => signToken(`u-${wallet.slice(0, 6)}`, wallet, { authTime: Math.floor(Date.now() / 1000) - 7 * 24 * 3600 });
+  const body = JSON.stringify({ reason: 'handler fixed, re-applying the outcome' });
   try {
     await withServer(async (base) => {
-      const raw = await put({ dailyLimitRaw: '123456789012345678901234567', perTraceLimitRaw: '1' }, base);
-      assert.equal(raw.status, 200);
-      assert.equal(raw.headers.get('deprecation'), null);
-      const rawBody = await raw.json();
-      assert.equal(stored[0].dailyLimitRaw, '123456789012345678901234567', 'beyond float precision, stored exactly');
-      assert.equal(rawBody.data.dailyLimitRaw, '123456789012345678901234567');
-      assert.equal(rawBody.data.perTraceLimitDisplay, '0.0000001');
-      for (const column of ['dailyLimit', 'perTraceLimit', 'spentToday']) assert.equal(column in rawBody.data, false);
+      const api = `${base}/api/v1/admin/chain/transactions`;
+      const post = (path: string, token: string, payload = body) =>
+        fetch(`${api}/${id}/${path}`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: payload });
 
-      const decimal = await put({ dailyLimit: '5', perTraceLimit: '0.3' }, base);
-      assert.equal(decimal.status, 200);
-      assert.equal(decimal.headers.get('deprecation'), null);
-      assert.deepEqual([stored[1].dailyLimitRaw, stored[1].perTraceLimitRaw], ['50000000', '3000000']);
-
-      const numeric = await put({ dailyLimit: 5, perTraceLimit: 0.1 + 0.2 }, base);
-      assert.equal(numeric.status, 400, '0.30000000000000004 has more than 7 decimals');
-      const legacy = await put({ dailyLimit: 5, perTraceLimit: 0.5 }, base);
-      assert.equal(legacy.status, 200);
-      assert.equal(legacy.headers.get('deprecation'), 'true');
-      assert.deepEqual([stored[2].dailyLimitRaw, stored[2].perTraceLimitRaw], ['50000000', '5000000']);
-
-      for (const body of [{}, { dailyLimitRaw: '1.5', perTraceLimitRaw: '1' }, { dailyLimit: '0.00000001', perTraceLimit: '0.1' }, { dailyLimit: true, perTraceLimit: '1' }]) {
-        const bad = await put(body, base);
-        assert.equal(bad.status, 400, JSON.stringify(body));
-        assert.equal((await bad.json()).error.code, 'VALIDATION_ERROR');
+      // No chain.outbox.* at all: 403 on reads and actions.
+      assert.equal((await fetch(api, { headers: { authorization: `Bearer ${fresh(outsider)}` } })).status, 403);
+      assert.equal((await fetch(`${api}/${id}`, { headers: { authorization: `Bearer ${fresh(outsider)}` } })).status, 403);
+      // Read-only role: every action is 403.
+      for (const path of ['recover', 'rerun-handler', 'abandon']) {
+        const res = await post(path, fresh(reader));
+        assert.equal(res.status, 403, path);
+        assert.equal((await res.json()).error.code, 'FORBIDDEN');
       }
-      const inverted = await put({ dailyLimit: '1', perTraceLimit: '2' }, base);
-      assert.equal(inverted.status, 400);
-      assert.equal((await inverted.json()).error.code, 'INVALID_ALLOWANCE');
+      // Operate without a fresh wallet signature: STEP_UP_REQUIRED.
+      for (const path of ['recover', 'rerun-handler', 'abandon']) {
+        const res = await post(path, stale(operator));
+        assert.equal(res.status, 403, path);
+        assert.equal((await res.json()).error.code, 'STEP_UP_REQUIRED');
+      }
+      assert.equal(audits.length, 0);
+
+      // The reason is required.
+      assert.equal((await post('rerun-handler', fresh(operator), '{"reason":"short"}')).status, 400);
+
+      const ok = await post('rerun-handler', fresh(operator));
+      assert.equal(ok.status, 200);
+      const json = await ok.json();
+      assert.equal(json.data.toStatus, 'FAILED');
+      assert.equal(json.data.handled, true);
+      assert.ok(row.handledAt, 'the handler re-ran and re-marked the row');
+
+      // A terminal row cannot be abandoned.
+      const refused = await post('abandon', fresh(operator));
+      assert.equal(refused.status, 409);
+      assert.equal((await refused.json()).error.code, 'OUTBOX_INVALID_STATE');
     });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(audits.length, 1, 'exactly one audit row: the generic request audit is off for these routes');
+    assert.equal(audits[0].data.action, 'CHAIN_OUTBOX_RERUN_HANDLER');
+    assert.equal(audits[0].data.actor, operator);
+    assert.equal(audits[0].data.target, id);
+    assert.deepEqual(
+      { ...audits[0].data.metadata, outcome: undefined },
+      {
+        outboxId: id, kind: 'test.console', fromStatus: 'FAILED', toStatus: 'FAILED',
+        reason: 'handler fixed, re-applying the outcome', hashes: ['ab'.repeat(32)], outcome: undefined,
+      },
+    );
   } finally {
-    (prisma.user.upsert as any) = orig.user;
-    (prisma.spendingAllowance.upsert as any) = orig.allowance;
+    (prisma.adminRoleAssignment.findUnique as any) = orig.role;
+    (prisma.adminAuditLog.create as any) = orig.audit;
+    (prisma as any).chainTransaction = orig.chainTransaction;
+    outbox.setRowLeaseRedisForTest(null);
   }
 });

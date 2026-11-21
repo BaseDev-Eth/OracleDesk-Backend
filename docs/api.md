@@ -91,6 +91,7 @@ the same key on every retry of it.
 | `POST /traces/verify` | optional |
 | `POST /traces/:id/unlock` | optional |
 | `POST /traces/payment-intents/:id/submit` | optional (idempotent by txHash) |
+| `POST /x402/allowance/reserve`, `/commit`, `/release` | **required** (service calls, scope `anon`) |
 | `POST /auth/challenge`, `POST /auth/verify` | not supported (the handshake is single-use, and `/auth/verify` returns a JWT that is never stored) |
 
 - **Format:** 1–255 printable ASCII characters. A UUID (`crypto.randomUUID()`) is recommended.
@@ -135,9 +136,23 @@ useMutation({
 
 `GET /readyz` → `200 { status: "ready", checks }` when every critical dependency is up, `503 NOT_READY` with `status: "not_ready"` otherwise, or `status: "draining"` once shutdown has begun. Each check is `{ name, ok, critical, latencyMs, error? }` for `database`, `redis`, `rpc` and `indexer`; `error` is one of `timeout`, `connection_refused`, `rpc_unhealthy`, `lagging`, `unavailable`. Probes time out after `HEALTH_PROBE_TIMEOUT_MS`, results are cached for `HEALTH_CACHE_TTL_MS` (failures for 500 ms) and concurrent calls share one run. `HEALTH_CRITICAL` (default `database,redis`) picks which dependencies fail readiness. Both endpoints bypass the rate limiter.
 
+Chain-write probes (#220): `outbox`, `signers` and `channels` are also listed. Each check is tri-state: ok, **degraded** (`ok: true`, `state: "degraded"`, an `error` class naming why) or failing (`ok: false`). Only a failing critical check returns 503; when any check is degraded and none critical is failing, `/readyz` returns `200` with `status: "degraded"`. On an instance that does not write (dry-run, or a `PROCESS_ROLE` without the outbox worker; see `HEALTH_CHAIN_WRITER`) the three probes are always ok and never critical, even when listed in `HEALTH_CRITICAL`. Additional `error` classes:
+
+| Probe | Class | Failing | Degraded |
+| --- | --- | --- | --- |
+| `outbox` | `backlog` | in-flight rows > `HEALTH_OUTBOX_MAX_INFLIGHT` | > half of it |
+| `outbox` | `stuck` | oldest in-flight row older than `HEALTH_OUTBOX_MAX_AGE_MS`, or any SUBMITTED/PENDING row past its `maxTime` | older than half of it |
+| `outbox` | `handler_failing` | a kind's completion handler failed `HEALTH_HANDLER_MAX_STREAK` times in a row on this instance, or a terminal row has waited for its handler longer than `HEALTH_OUTBOX_MAX_AGE_MS` | |
+| `signers` | `low_balance` | agent or fee payer below reserve (`(2 + subentries) × 0.5 XLM + 1 XLM`) | runway below `HEALTH_BALANCE_MIN_RUNWAY_HOURS` |
+| `signers` | `account_missing` | agent or fee payer account does not exist (unfunded) | |
+| `channels` | `channels_exhausted` | channels configured and none healthy (all below `CHANNEL_MIN_BALANCE_XLM`) | |
+| `channels` | `low_balance` | | some channels unhealthy |
+
 `GET /health` → `{ status: "healthy", uptime: number }`. Deprecated: it sends `Deprecation: true` and `Link: </readyz>; rel="successor-version"`.
 
 `GET /api/v1/admin/status` (admin JWT) → probe details with latencies, indexer cursor vs RPC latest ledger and lag, last success/failure per cron job (in memory, reset on restart), chain execution mode, agent public key, LLM provider configuration and Gemini breaker state, and process info.
+
+`chainWrites` (#220): `{ writer, outbox, handlers, balances, channels }`. `outbox` is the row count per status (terminal statuses count only rows whose handler has not run) plus `inFlight`, `oldestInFlightMs`, `pastMaxTime` and `oldestUnhandledMs`. `handlers` is `{ scope: "instance", kinds: { <kind>: { count, lastErrorClass, since } } }` (error class only, never the message). `balances` is the cached snapshot `{ stale, takenAt, accounts: [{ publicKey, role: agent|feePayer|channel, stroops, minStroops, runwayHours, estimated?, checkedAt, error? }] }` with stroops as decimal strings; `runwayHours` is `(stroops − minStroops) / (24 h spend / 24)` and `null` with no spend history; `estimated` means part of the spend is `total_fee` (no `fee_charged`) or a bump's bid fee. `channels` is `{ total, healthy, leased, accounts: [{ publicKey, healthy, stroops, checkedAt }] }`. Public keys only, never secrets.
 
 `GET /api/v1/admin/chain/spec-compat` (admin JWT) → `{ mode, report }`: the contract spec compatibility report from the boot gate (#34). `report` lists, per contract, the deployed wasm hash against the pinned one and every spec difference with its `breaking`/`compatible` classification; it is `null` when the gate has not run (`SPEC_COMPAT_ENFORCE=off`). See "Contract compatibility" in `docs/architecture.md`.
 
@@ -567,14 +582,15 @@ entry for the call that proposed the market.
 | `schema` | Version string of this block. Check it before reading the rest. |
 | `llm[]` | One entry per generation step, in order: the market proposal (creation traces only), then the hedge conditions. |
 | `source` | `llm`: a model produced the output. `default`: a hard-coded safe default was used (`reason` is `LLM_FAILED` or `LLM_BUDGET_EXCEEDED`); such an entry has no model fields. |
-| `provider`, `model` | Who answered. When Gemini served the call, `fallbackFrom` names the provider that failed first. |
+| `provider`, `model` | Who answered: `anthropic`, `gemini` or (since #218) `openai`. When a later policy entry served the call, `fallbackFrom` names the one that failed first. |
 | `promptId`, `promptVersion`, `promptHash` | The registered prompt (`src/lib/prompts`). `promptHash = sha256(canonicalJson({ id, version, system, user }))` over the *template*, not the rendered text. `adhoc`/`0` marks a call that did not use the registry. |
 | `params` | Sampling temperature and the `max_tokens` the serving provider was finally given. |
 | `usage` | Tokens summed over the serving provider's requests; `null` when the SDK reported none. |
 | `latencyMs` | Wall time of the whole call, fallback and repair rounds included. Differs on every run. |
 | `attempts` | Provider requests made, repair rounds and Gemini 429 retries included. |
-| `fallbackFrom` | `{ provider, model, errorClass }`; `errorClass` is one of `validation`, `rate_limited`, `timeout`, `auth`, `circuit_open`, `budget`, `unavailable`, `server_error`, `error`. Provider messages are never recorded. |
-| `outputSha256` | sha256 of the raw model output (canonical JSON of the tool input for Anthropic, the response text for Gemini). Raw prompts and outputs are never stored. |
+| `fallbackFrom` | `{ provider, model, errorClass }`: the first policy entry that was attempted and failed. `errorClass` is one of `validation`, `rate_limited`, `timeout`, `auth`, `circuit_open`, `budget`, `unavailable`, `server_error`, `error`. Provider messages are never recorded. |
+| `route` | Optional (#218): `{ task, chain: [{ provider, model, decision }] }`, the task's policy chain as evaluated, in order. `decision` is `served`, one of the `errorClass` values, `unconfigured` (no key), `cooling` or `open` (skipped by the router's provider health). Absent on older traces. |
+| `outputSha256` | sha256 of the raw model output (canonical JSON of the tool input for Anthropic, the response text for Gemini and OpenAI). Raw prompts and outputs are never stored. |
 | `generator` | The service and its `package.json` version; `commit` appears when `GIT_SHA` is set. |
 
 The block is optional: traces created before #66 have none, and consumers must
@@ -722,12 +738,23 @@ numbers are still accepted for one release: they are converted with
 allowance DTO above, or `null` from `GET` when none is set. Errors:
 `400 VALIDATION_ERROR`, `400 INVALID_ALLOWANCE`.
 
+`GET` reports today's figures from the UTC day bucket (#219), not the
+deprecated single-day columns: `spentTodayRaw` / `spentToday` are what was
+booked to today's bucket, plus `dayStart` (ISO, the UTC day reported),
+`reservedRaw` (held by open x402 reservations), `todayOverageRaw` and
+`remainingRaw` (`dailyLimitRaw − spentTodayRaw − reservedRaw`, floored at 0;
+`null` without a daily limit). `overageRaw` stays the lifetime total.
+
 #### `POST /traces/access/preauthorize` (auth)
 
 Advisory-only allowance check (#53). Body
 `{ type?: "DAILY_PASS" | "PER_TRACE", amountRaw?: "base units" }`; for
 `DAILY_PASS` the price defaults to `DAILY_PASS_PRICE_RAW` and for `PER_TRACE`
-`amountRaw` is required. It never writes or reserves budget. Response:
+`amountRaw` is required. It never writes or reserves budget. It checks today's
+UTC bucket (`dayStart`) and counts open x402 reservations (`reservedRaw`)
+against the daily limit as well as spend (#219). The payment itself is charged
+to the UTC day its ledger closes, so a transfer signed at 23:59:58 that closes
+at 00:00:03 is checked against today but booked to tomorrow. Response:
 
 ```json
 {
@@ -736,9 +763,11 @@ Advisory-only allowance check (#53). Body
   "active": true,
   "allowed": false,
   "reason": "ALLOWANCE_DAILY_LIMIT",
+  "dayStart": "2026-11-20T00:00:00.000Z",
   "dailyLimitRaw": "5000000",
   "perTraceLimitRaw": "5000000",
-  "spentTodayRaw": "4000000",
+  "spentTodayRaw": "3000000",
+  "reservedRaw": "1000000",
   "remainingRaw": "1000000",
   "overageRaw": "0",
   "wouldOverflowRaw": "4000000"
@@ -746,8 +775,82 @@ Advisory-only allowance check (#53). Body
 ```
 
 An over-limit payment is still accepted on-chain and flagged
-(`allowanceOverage` on the `PaymentEvent`, `overageRaw` on the allowance); it is
-never refused and never silently dropped.
+(`allowanceOverage` on the `PaymentEvent`, `overageRaw` on the allowance and on
+the day bucket); it is never refused and never silently dropped. Reservations
+never make a pass claim fail: they only reduce the remaining budget, so a claim
+may be flagged as overage instead.
+
+#### x402 allowance reservations (#219, service-to-service)
+
+`POST /x402/allowance/reserve`, `/commit` and `/release` are called by the x402
+trace service (contracts repo) around each per-trace settlement, so per-trace
+purchases are held to the same per-trace and daily limits as passes. They are
+not for browsers.
+
+**Authentication.** HMAC-SHA256 with the shared secret
+`X402_ALLOWANCE_HMAC_SECRET` (32+ characters, loaded through the secret store,
+`_FILE` supported, never `X402_KEY_RELEASE_SECRET`). Every request carries:
+
+| Header | Value |
+|---|---|
+| `X-OracleDesk-Timestamp` | Unix seconds; rejected when more than 60 s from server time |
+| `X-OracleDesk-Signature` | lowercase hex `HMAC-SHA256(secret, METHOD + "\n" + path + "\n" + timestamp + "\n" + hex(SHA-256(body)))` |
+| `Idempotency-Key` | required on all three routes (see Idempotency) |
+
+`path` is the request target exactly as sent, e.g.
+`/api/v1/x402/allowance/reserve` (with any query string); `body` is the exact
+request bytes (hash of the empty string when there is none). A missing, stale
+or wrong signature, or a body changed after signing, is
+`401 SERVICE_AUTH_INVALID`; an unconfigured secret is
+`503 SERVICE_AUTH_NOT_CONFIGURED`. During a secret rotation the previous value
+is accepted for the secret store's grace window.
+
+```ts
+const ts = Math.floor(Date.now() / 1000).toString();
+const body = JSON.stringify(payload);
+const sig = createHmac('sha256', secret)
+  .update(`POST\n${path}\n${ts}\n${createHash('sha256').update(body).digest('hex')}`)
+  .digest('hex');
+```
+
+**`POST /x402/allowance/reserve`** — body
+`{ payer: "G…|M…", subId?: "digits", subIdKind?: "MUXED" | "MEMO", traceId, amountRaw: "base units", nonce }`.
+The payer is resolved to a user by `identityKey` only (the login derivation:
+`G…`, or `G…#muxed:<id>` / `G…#memo:<id>`; an `M…` payer carries its muxed id),
+never by `walletAddress`. Checks `amountRaw` against the per-trace limit and
+against `dailyLimitRaw − spentRaw − reservedRaw` of today's UTC bucket.
+
+| Outcome | Response |
+|---|---|
+| Unknown payer, or no active allowance | `200 { allowed: true, active: false, reservationId: null }` (nothing to enforce; settle normally) |
+| Fits | `201 { allowed: true, active: true, reservationId, dayStart, expiresAt, remainingRaw, replay }`; the amount is held for `X402_ALLOWANCE_RESERVATION_TTL_SECONDS` (default 120) |
+| Over the per-trace limit | `403 ALLOWANCE_PER_TRACE_LIMIT` (`details.perTraceLimitRaw`) |
+| Over the remaining daily budget | `403 ALLOWANCE_DAILY_LIMIT` (`details.dayStart`, `details.remainingRaw`) |
+| Same `(payer, nonce)` again | the same reservation (`replay: true`); with a different amount or trace, `409 ALLOWANCE_NONCE_REUSED` |
+
+Do not settle on a `403`.
+
+**`POST /x402/allowance/commit`** — after settlement, body
+`{ reservationId, txHash: "64-hex", ledgerCloseTime?: unixSeconds | "ISO-8601", amountRaw, payer?, subId?, subIdKind?, traceId? }`.
+Books the settled amount on the UTC day of `ledgerCloseTime` (which may be the
+day after the reservation) and returns the reservation's hold to its own day.
+The money already moved, so a commit is always booked: an expired, released or
+unknown reservation (`late: true`) is charged like a claim, with whatever no
+longer fits the day recorded as overage. An unknown `reservationId` needs
+`payer` to be attributed, otherwise `404 ALLOWANCE_RESERVATION_NOT_FOUND`.
+Without `ledgerCloseTime` the current UTC day is used and `dayInferred: true`.
+Idempotent per `txHash`. Response `200`:
+`{ committed, active, reservationId, chargeId, day: "YYYY-MM-DD", dayInferred, overageRaw, perTraceExceeded, late, replay }`.
+Errors: `409 ALLOWANCE_RESERVATION_COMMITTED` (already committed with another
+`txHash`).
+
+**`POST /x402/allowance/release`** — body `{ reservationId }`, when settlement
+did not happen. Returns `{ reservationId, status, released }`; releasing a
+reservation that is no longer `RESERVED` changes nothing. Errors:
+`404 ALLOWANCE_RESERVATION_NOT_FOUND`.
+
+Reservations not committed or released are expired by the payment-intent cron
+(`PAYMENT_INTENT_CONFIRM_CRON`), which returns their budget.
 
 #### `POST /traces/payment-intents` (auth)
 
@@ -1068,6 +1171,73 @@ Query parameters: `page`, `limit`, `status`.
 
 Schedules a trace audit run asynchronously in the background.
 Response `202 Accepted`: `{ "runId": "uuid", "message": "Trace audit run scheduled" }`.
+
+#### Outbox console (#221)
+
+`GET /admin/fees` (`admin.read`) aggregates `chain_fees` per day; the outbox
+console exposes the individual chain writes behind it: every live write is a
+`chain_transactions` row moving `BUILT → SIGNED → SUBMITTED → PENDING →
+SUCCESS | FAILED | EXPIRED` (#35). Reads need `chain.outbox.read` (granted to
+`operator` and `auditor`); actions need `chain.outbox.operate` (`operator`) and
+step-up (`403 STEP_UP_REQUIRED`). Both permissions reach existing databases
+through the `20261120100000_outbox_console_permissions` migration.
+
+No response or log line carries the signed envelope XDR, transaction or
+auth-entry signature bytes, or fee-bump envelopes.
+
+- `GET /admin/chain/transactions?status&kind&refId&hash&unhandled&olderThanSecs&page&limit`
+  — newest first. `status` is a comma-separated list of the statuses above;
+  `hash` (64 hex) matches the inner, landed or any fee-bump hash; `unhandled=true`
+  lists terminal rows whose completion handler has not run (`false` excludes
+  them); `olderThanSecs` keeps rows created at least that long ago. Rows carry
+  ids, kind, refId, status, hashes, bump/attempt counts, `submitLedger`,
+  `ledger`, timebounds, `error` and `handledAt`.
+- `GET /admin/chain/transactions/:id` — the row plus:
+  - `envelope`: `{ source, sequence, fee, timeBounds, operations: [{ type, contract, function, args }], authEntries: [{ address, nonce, signatureExpirationLedger }], signatureCount }`
+    (args decoded with `scValToNative`, BigInt as decimal strings);
+  - `feeBumps`: `[{ hash, fee, inclusionPerOp, at }]`;
+  - `rpc`: `getTransaction` for the inner hash and every fee-bump hash
+    (`status`, `ledger`, `latestLedgerCloseTime`, `oldestLedger`, decoded
+    `error` for `FAILED`). `resultXdr` is never stored, so results only exist
+    while RPC retains them;
+  - `expiry` (in-flight rows nothing landed for): the ledger-time expiry
+    decision `PENDING | EXPIRED | UNKNOWN` and its reason;
+  - `linked`: `market.create` → `{ market, creationAttempt }`, `trade.buy` →
+    `{ trade }`, `trade.sell` → `{ positionExit }`, `trace.publish` →
+    `{ reasoningTrace, tracePublication }`, other kinds `null`.
+
+Actions take `{ "reason": "10-500 chars" }`, run under the per-row Redis lease
+`outbox:row:<id>` that the recovery worker also takes, and each writes one
+`admin_audit_logs` row (`CHAIN_OUTBOX_RECOVER | CHAIN_OUTBOX_RERUN_HANDLER |
+CHAIN_OUTBOX_ABANDON`, metadata `{ outboxId, kind, fromStatus, toStatus,
+reason, hashes, outcome }`). Response: `{ id, kind, fromStatus, toStatus, handled, stats? }`.
+
+| Action | Preconditions | Effect |
+|---|---|---|
+| `POST /admin/chain/transactions/:id/recover` | non-terminal, or terminal with `handledAt` unset. `BUILT`/`SIGNED` rows younger than the 30 s signing grace belong to the live writer and are refused. | One recovery pass for the row (resolve by hash, resubmit `SIGNED`, expire by ledger time, fee-bump), or the missing completion handler. |
+| `POST /admin/chain/transactions/:id/rerun-handler` | `SUCCESS`, `FAILED` or `EXPIRED`. | Clears `handledAt` by compare-and-set, re-runs the kind's handler from the stored outcome (handlers are idempotent; `market.create` only links, never creates, a market) and marks it handled again. |
+| `POST /admin/chain/transactions/:id/abandon` | `SIGNED`, `SUBMITTED` or `PENDING`; no hash (inner or fee bump) landed; the latest ledger closed after `maxTime` + 60 s **and** `submitLedger` is inside RPC retention (`>= oldestLedger`). | `→ EXPIRED` with `error: "abandoned by admin: <reason>"`, then the `EXPIRED` handler. A `SIGNED` row may already have been sent, so it is judged exactly like `SUBMITTED`. |
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 409 | `OUTBOX_ROW_BUSY` | The recovery worker or another operator holds the row lease; retry shortly. |
+| 409 | `OUTBOX_ROW_LANDED` | Abandon found a landed hash; the row was resolved by normal recovery instead (`details.landedHash`, `details.status`). |
+| 409 | `OUTBOX_NOT_PROVABLE` | Abandon cannot prove the envelope is dead: ledger time not past `maxTime` + skew (`decision: PENDING`), submission outside RPC retention or `submitLedger` unknown (`UNKNOWN`), or no `maxTime` (rows written before #42). |
+| 409 | `OUTBOX_INVALID_STATE` | The status does not allow the action, or the row moved concurrently. |
+| 404 | `OUTBOX_NOT_FOUND` | No such row. |
+| 500 | `OUTBOX_HANDLER_FAILED` | The completion handler threw; the row stays unhandled and the worker retries it. |
+| 503 | `OUTBOX_LEASE_UNAVAILABLE` | Redis is down; actions fail closed. |
+| 503 | `OUTBOX_RPC_UNAVAILABLE` | Abandon could not query every hash. |
+
+The recovery worker decides expiry the same way (ledger close time and RPC
+retention, never the host clock); when expiry is unprovable it leaves the row
+in flight with the reason in `error`. After an abandon, the agent's cached
+sequence (`stellar/sequence.ts`) is one ahead of the account: the next live
+write is rejected `tx_bad_seq` before submission, resyncs the sequence from
+RPC and is rebuilt by the retry loop (`BAD_SEQUENCE → resync-rebuild`), so no
+manual repair is needed.
 
 ### Agent controls (admin auth, #79)
 

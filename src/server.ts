@@ -23,6 +23,7 @@ import { startOpsAlertCron } from './cron/ops-alerts.cron';
 import { startEventListener } from './services/indexer.service';
 import { gateDecision, runSpecCompatGate } from './services/stellar/spec-compat';
 import { startOutboxWorker } from './services/stellar/outbox';
+import { getChannelPool } from './services/stellar/channels';
 import { resumeIncomplete } from './services/market-saga.service';
 import { closeRedis, getRedis, checkRedisPolicy, releaseAllWaiters } from './lib/redis';
 import { onShutdown, runShutdown } from './lib/shutdown-coordinator';
@@ -142,6 +143,9 @@ async function bootstrap(): Promise<void> {
   // keep recovering on an interval (one instance at a time via a Redis lock).
   if (rolePlan.startOutbox) {
     stopOutboxWorker = startOutboxWorker();
+    // Channel balances feed the pool's healthy flags and the channels probe
+    // (#220). Only writer roles lease channels; the monitor is a no-op in dry-run.
+    if (config.CHAIN_EXECUTION_MODE === 'live') getChannelPool().startBalanceMonitor();
   }
 
   // 1d. Market generation saga (#242): resume runs a previous process left
