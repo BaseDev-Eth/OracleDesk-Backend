@@ -25,8 +25,9 @@ import { secret } from '../config/secrets';
 import { chainWritesStatus, health } from '../services/health.service';
 import { indexerStatus } from '../services/indexer.service';
 import { agentSigner } from '../services/stellar/clients';
-import { effectiveMode, specCompatReport } from '../services/stellar/spec-compat';
+import { acknowledgeSpecDrift, getSpecCompatHistory } from '../services/stellar/spec-monitor';
 import { getFeeOracle } from '../services/stellar/fees';
+import { getChainCache } from '../lib/chain-cache';
 import { getLlmUsage } from '../lib/llm-budget';
 import { getCronStatus } from '../cron/registry';
 import { MAX_SILENCE_MINUTES, acknowledgeIncident, listIncidents, silenceIncident } from '../services/ops-alerts/incidents';
@@ -287,14 +288,24 @@ export async function triggerTraceAuditRun(req: Request, res: Response): Promise
 }
 
 /**
- * GET /admin/chain/spec-compat (#34)
- * The last contract spec compatibility report from the boot gate: per
- * contract, the deployed wasm hash against the pinned one and every spec
- * difference with its breaking/compatible classification. `report` is null
- * when the gate has not run (SPEC_COMPAT_ENFORCE=off).
+ * GET /admin/chain/spec-compat (#34, #322)
+ * Returns the enforcement mode, boot report, current report, and paginated
+ * runtime check history (`spec_compat_runs`).
  */
-export async function getSpecCompat(_req: Request, res: Response): Promise<void> {
-  sendSuccess(res, { mode: effectiveMode(), report: specCompatReport() });
+export async function getSpecCompat(req: Request, res: Response): Promise<void> {
+  const { page, limit, skip } = parsePagination(req.query as any);
+  const { mode, report, boot, current, history, total } = await getSpecCompatHistory({ skip, take: limit });
+  sendSuccess(res, { mode, report, boot, current, history }, 200, buildPaginationMeta(page, limit, total) as any);
+}
+
+/**
+ * POST /admin/chain/spec-compat/ack (#322)
+ * Acknowledges the current breaking spec drift report and clears `spec_drift`
+ * holds once a compatibility check passes.
+ */
+export async function ackSpecCompat(req: Request, res: Response): Promise<void> {
+  const result = await acknowledgeSpecDrift(actor(req));
+  sendSuccess(res, result);
 }
 
 /**
@@ -321,6 +332,7 @@ export async function getSystemStatus(_req: Request, res: Response): Promise<voi
       mode: config.CHAIN_EXECUTION_MODE,
       agentPublicKey: agentSigner().publicKey ?? null,
       preflight: 'not_implemented',
+      cache: getChainCache().stats(),
     },
     // Outbox backlog, handler streaks, signer/channel balances (#220). Public keys only.
     chainWrites: await chainWritesStatus().catch(() => null),

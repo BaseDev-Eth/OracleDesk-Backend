@@ -28,6 +28,7 @@ import { logger } from '../lib/logger';
 import { newId, runWithContext } from '../lib/context';
 import { readClients, rpcServer } from './stellar/clients';
 import { disabledEventProjections } from './stellar/spec-compat';
+import { requestSpecCheck } from './stellar/spec-monitor';
 import { printable } from './chain.service';
 import { priceYesBps } from '../generated/fpmm';
 import { withTimeout, deadline } from '../lib/resilience';
@@ -103,6 +104,7 @@ export function decodeEvent(event: rpc.Api.EventResponse, known = specs()): Deco
       { contract: entry.name, eventId: event.id, err: err instanceof Error ? err.message : String(err) },
       'Indexer: event does not decode with the binding spec (skipped; see /admin/chain/spec-compat)',
     );
+    requestSpecCheck(`decode_failure:${entry.name}`);
     return null;
   }
   if (!parsed) return null;

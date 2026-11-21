@@ -3,6 +3,7 @@ import { requireAuth, requirePermission, requireStepUp } from '../middlewares/au
 import {
   ackAlert,
   ackDispute,
+  ackSpecCompat,
   addOperationSignature,
   cancelDisputeTx,
   cancelTreasuryOperation,
@@ -76,6 +77,7 @@ router.get('/agent-decisions/cycles/:cycleId', requirePermission('admin.read'), 
 router.post('/agents/:agent/pause', requirePermission('agents.manage'), pauseAgentControl);
 router.post('/agents/:agent/resume', requirePermission('agents.manage'), resumeAgentControl);
 router.get('/status', requirePermission('admin.read'), getSystemStatus);
+router.get('/crons/:job/runs', requirePermission('admin.read'), getCronRuns);
 router.get('/fees', requirePermission('admin.read'), getChainFeesReport);
 router.get('/execution-quality', requirePermission('admin.read'), getExecutionQuality);
 router.get('/disputes', requirePermission('disputes.manage'), getDisputes);

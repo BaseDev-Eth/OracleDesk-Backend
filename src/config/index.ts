@@ -540,6 +540,11 @@ export const envObjectSchema = z
       .string()
       .default('')
       .refine((v) => ['', 'off', 'warn', 'enforce'].includes(v), 'must be off, warn or enforce'),
+    // Runtime spec-compat monitor (#322): periodic interval, debounce gap for
+    // signal-triggered checks, and consecutive unverifiable runs before pause.
+    SPEC_COMPAT_INTERVAL_MS: z.string().default('600000').transform(Number).pipe(z.number().int().min(1000)),
+    SPEC_COMPAT_MIN_GAP_MS: z.string().default('60000').transform(Number).pipe(z.number().int().min(100)),
+    SPEC_COMPAT_UNVERIFIABLE_RUNS: z.string().default('3').transform(Number).pipe(z.number().int().min(1)),
 
     TRUST_INBOUND_REQUEST_ID: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
     INDEXER_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
@@ -566,6 +571,9 @@ export const envObjectSchema = z
     HEALTH_BALANCE_TTL_MS: z.string().default('60000').transform(Number).pipe(z.number().int().min(0)),
     // Time /readyz reports "draining" before the HTTP server stops accepting.
     SHUTDOWN_DRAIN_MS: z.string().default('5000').transform(Number),
+
+    // ── Cron run history retention (#336) ─────────────────────────────────
+    CRON_RUNS_RETENTION_DAYS: z.string().default('14').transform(Number).pipe(z.number().int().min(1)),
 
     // ── Semantic dedup (#69) ──────────────────────────────────────────────
     // none keeps the lexical check. The vector column is vector(768): the
@@ -635,9 +643,25 @@ export const envObjectSchema = z
       .pipe(z.number().int().positive()),
     LLM_DAILY_COST_BUDGET_MICROS: z.string().default('20000000').transform(Number)
       .pipe(z.number().int().positive()),
-    // Share of the budgets held back for admin-triggered work (cron stops first).
+    // Share of the budgets held back for admin-triggered work (deprecated in
+    // favour of LLM_CLASS_POLICY; maps onto admin.guaranteePct, #327).
     LLM_ADMIN_RESERVE_PCT: z.string().default('10').transform(Number)
       .pipe(z.number().min(0).max(100)),
+    // Per-purpose class budget policy JSON (#327): guarantees must sum to <= 100.
+    LLM_CLASS_POLICY: z
+      .string()
+      .default('')
+      .refine((v) => {
+        if (!v.trim()) return true;
+        try {
+          return llmClassPolicySchema.safeParse(JSON.parse(v)).success;
+        } catch {
+          return false;
+        }
+      }, 'must be valid JSON matching ClassPolicy per class with sum(guaranteePct) <= 100'),
+    // Max wait for a time-critical dispute review when rate-limited (#327, default 10 min).
+    LLM_DISPUTE_MAX_WAIT_MS: z.string().default('600000').transform(Number)
+      .pipe(z.number().int().positive()),
     LLM_ANTHROPIC_RPM: z.string().default('12').transform(Number)
       .pipe(z.number().int().positive()),
     LLM_GEMINI_RPM: z.string().default('15').transform(Number)
