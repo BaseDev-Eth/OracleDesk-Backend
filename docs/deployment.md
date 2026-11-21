@@ -2,21 +2,39 @@
 
 ## Pipeline
 
-1. **Verify** — CI jobs (contract sync, migrations, build, tests, actionlint,
-   shellcheck).
-2. **Image** — buildx pushes `ghcr.io/<repo>@sha256:<digest>`, cosign signs the
-   digest, Syft emits an SPDX SBOM.
-3. **Staging** — `deploy-env.yml` verifies the cosign identity, lints migrations
-   and runs `helm upgrade --install --atomic`.
-4. **Staging checks** — readiness must hold 3 consecutive probes, indexer lag
-   must be ≤ 120 ledgers and the cursor must advance.
-5. **Production** — same reusable workflow with the production GitHub
-   Environment (required reviewers).
-6. **Production checks** — 5 consecutive readiness probes plus the same lag,
-   cursor and Prometheus checks.
+1. **Verify** — CI jobs (contract sync, migrations, build, tests, Dockerfile build check, Helm lint).
+2. **Image** — buildx pushes `ghcr.io/<repo-lowercase>@sha256:<digest>` from `Dockerfile`, cosign signs the digest, Syft emits an SPDX SBOM.
+3. **Staging** — `deploy-env.yml` verifies the cosign identity, lints changed migrations, and runs `helm upgrade --install --atomic` using `deploy/helm/oracledesk-backend/`. A Helm `pre-install,pre-upgrade` Job runs `npx prisma migrate deploy` in-cluster from the release image digest.
+4. **Staging checks** — readiness must hold 3 consecutive probes, every Deployment (`api`, `indexer`, `worker`) must run the release digest and complete rollout, indexer lag must be ≤ 120 ledgers, and the cursor must advance.
+5. **Production** — same reusable workflow with the production GitHub Environment (required reviewers).
+6. **Production checks** — 5 consecutive readiness probes plus the same digest, rollout, lag, cursor, and Prometheus checks.
 
-Secrets (kubeconfig, Helm values) live in GitHub Environments. The image is
-referenced by digest, never by a mutable tag.
+Secrets (kubeconfig, Helm values) live in GitHub Environments; `values-*.yaml` never contain secret values (pods consume an existing Kubernetes Secret via `.Values.existingSecret`). The image is referenced by lowercase repository and digest, never by a mutable tag.
+
+## Container Image & Process Roles (#272)
+
+Build locally:
+
+```bash
+docker build -t oracledesk-backend:local .
+```
+
+The multi-stage `Dockerfile` builds on `node:22-bookworm-slim` (matching `.nvmrc`), generates the Prisma client for `["native", "debian-openssl-3.0.x"]`, ships `dist/`, production dependencies, `prisma/migrations`, and `tini`, and runs as non-root `node`.
+
+`PROCESS_ROLE` splits the single image across three Kubernetes Deployments:
+
+| Subsystem | `all` (default) | `api` | `indexer` | `worker` |
+| --- | --- | --- | --- | --- |
+| Secrets, embeddings, Prisma, Redis policy, spec-compat gate | ✓ | ✓ | ✓ | ✓ |
+| HTTP API, Socket.IO, Redis fanout, RBAC bootstrap | ✓ | ✓ | | |
+| Soroban event listener (`startEventListener`) | ✓ | | ✓ | |
+| Outbox worker, cron jobs, sequence sync, saga resume | ✓ | | | ✓ |
+| Probe-only HTTP server (`/livez`, `/readyz` only) | | | ✓ | ✓ |
+
+Constraints:
+- `PROCESS_ROLE=indexer` requires `INDEXER_ENABLED=true` and `EVENT_BUS_ENABLED=true` so indexed events reach `api` pods over Redis streams.
+- `indexer` and `worker` Deployments run `replicas: 1` with `strategy: Recreate` until leader election lands.
+- `helm upgrade --atomic` rolls back the Helm release on failure, while any completed pre-upgrade migration Job is not reverted (consistent with expand/contract).
 
 ## Migration rule: expand / contract
 
@@ -70,31 +88,92 @@ DIGEST=<sha256> ./scripts/post-deploy-checks.sh
 
 Checks are read-only. `SKIP_KUBE=1` omits the digest check in local tests.
 
-## Price-market feed health & post-resolution verification (#309)
+## Configuration lifecycle (#243)
 
-Open Reflector price-mode markets are checked every 15 minutes (and every 5
-minutes within `PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS` of close) using fresh
-SEP-40 reads (`assets()`, `decimals()`, `resolution()`, `lastprice()`, and
-recent `price(asset, ts)` grid slots) evaluated against the **latest ledger
-close time**. Inspect status via `GET /api/v1/admin/price-markets/health`.
+`src/config/index.ts` (`envObjectSchema`) is the single list of variables the
+backend accepts. Keys that nothing reads are classified in
+`src/config/meta.ts` (`KEY_LIFECYCLE`):
 
-### Guardian actions by open-market severity
+| Status | Meaning | Boot behavior when set |
+| ------ | ------- | ---------------------- |
+| `active` (default) | Read by the code | — |
+| `reserved` | Feature not landed (e.g. `KEEPER_*`, `SSE_*`, `RESOLUTION_ATTESTATION_*`, `X402_FACILITATOR_*`) | Warns "has no effect in this version" |
+| `deprecated` | Scheduled for removal after `removeAfter` | Warns; if `replacedBy` is set and unset in env, the old value is mapped to the new key for one release |
 
-| Severity | Triggers | Recommended guardian action |
-|---|---|---|
-| `OK` | Asset supported, decimals & resolution unchanged, age ≤ `maxStaleness / 2`, zero grid gaps. | No action required. |
-| `WARN` | `FEED_AGING` (`ageSecs > maxStaleness / 2`), `FEED_STALE` / `NO_DATA` outside the close window, `GRID_GAPS` in the last `PRICE_FEED_GAP_SLOTS` slots, or `RESOLUTION_CHANGED`. | Monitor the Reflector feed status and upstream oracle announcements; confirm whether updates resume before the close window. Pause new price-market creation if the feed is degraded. |
-| `CRITICAL` | `FEED_UNSUPPORTED` (asset removed from `assets()`), `DECIMALS_CHANGED` (committed fixed-point threshold no longer matches the intended price), or `STALE_NEAR_CLOSE` / `NO_DATA_NEAR_CLOSE` within `PRICE_FEED_MONITOR_CLOSE_WINDOW_SECS` of close. | **Act before finality**: `resolve_price` finalises immediately with no dispute window, and `guardian_void_market` rejects a `Finalized` market. Verify the feed on-chain and, if the market cannot settle safely, invoke `guardian_void_market` from `RESOLVER_GUARDIAN_ADDRESS` before close/resolution. |
+Boot also warns about an unknown variable in one of the app's prefix families
+(`CHANNEL_`, `KEEPER_`, `X402_`, ...) or within edit distance 2 of a schema key,
+with a suggestion (`CHANEL_LEASE_MS` → `CHANNEL_LEASE_MS`). `<SECRET>_FILE`
+variants of secret names are accepted. Warnings use `console.warn` once per
+key and are silent under `NODE_ENV=test`.
 
-### Post-resolution verification verdicts
+Set `CONFIG_STRICT=true` to make any of these warnings fail boot with a
+`ConfigError` instead. Recommended for production once the warnings are clean.
 
-On every indexed `PriceResolution` event, the backend verifies the settled
-outcome against the committed spec and the close-time snapshot (`price_close_snapshots`):
+`npm run check:config` (`scripts/check-config-usage.ts`, TypeScript compiler
+API over `src/`, `scripts/` and `prisma/`) reports keys read but not declared,
+`active` keys never read, and `config as any` access. Reads inside
+`src/config/index.ts` (including `superRefine` cross-checks) do not count as
+usage.
 
-| Verdict | Meaning | Action |
-|---|---|---|
-| `CONSISTENT` | Event outcome matches `expectedOutcome(price, threshold, direction)`, event price/timestamp match the close snapshot, and no outcome-flipping outlier was detected. | Record audited; no action required. |
-| `UNVERIFIABLE` | No close snapshot was captured and feed history aged out on-chain. | Check why `captureCloseSnapshot` did not record before feed retention expired; verify RPC availability. |
-| `OUTCOME_MISMATCH` | Spec hash mismatch or `expectedOutcome` disagrees with the on-chain event outcome (**CRITICAL**). | Treat as a severe resolver/spec incident. Pause agents (`POST /api/v1/admin/agents/ALL/pause`) and investigate contract/spec state immediately. |
-| `PRICE_MISMATCH` | Event price or timestamp differs from the Reflector record at `close_time` (**CRITICAL**). | Audit the transaction XDR and Reflector storage history; verify no retroactive feed mutation or resolver misconfiguration occurred. |
-| `OUTLIER` | Event price deviated from the median of neighbouring grid records by > `PRICE_VERIFY_OUTLIER_BPS` **and** the threshold lies between the event price and the median (flipping the outcome) (**CRITICAL**). | Inspect the `detail` payload (`deviationFromMedianBps`, `distanceToThresholdBps`, `medianPrice`), audit the Reflector oracle feed, and consider removing the feed from `REFLECTOR_FEEDS_JSON`. |
+## SEP-7 `stellar.toml` Hosting (#270)
+
+When `URI_REQUEST_SIGNING_SECRET` is configured, the backend serves a minimal
+SEP-7 `/.well-known/stellar.toml` (`NETWORK_PASSPHRASE` and
+`URI_REQUEST_SIGNING_KEY`, `Content-Type: text/plain`,
+`Access-Control-Allow-Origin: *`). Wallets fetch this file from
+`https://<SEP7_ORIGIN_DOMAIN>/.well-known/stellar.toml`; if the API runs on a
+subdomain, add an edge reverse-proxy rule on `SEP7_ORIGIN_DOMAIN` forwarding
+`/.well-known/stellar.toml` to the backend. See
+`docs/runbooks/treasury-sep7.md` for key rotation steps.
+
+## IPFS Multi-Provider Replication & Hedged Gateways (#271)
+
+Configure redundant pinning via `IPFS_PROVIDERS` (`pinata`, `kubo`, `psa`),
+`IPFS_KUBO_API_URL` / `IPFS_KUBO_AUTH`, `IPFS_PSA_ENDPOINT` / `IPFS_PSA_TOKEN`,
+and `IPFS_MIN_REPLICAS` (required to be `>= 2` in production). All pinned JSON
+documents are capped at `IPFS_SINGLE_BLOCK_MAX` (256 KiB) so every provider
+produces the identical CIDv1 raw/sha2-256 digest (`cidForBytes`). Reads use
+health-scored hedged gateways (`IPFS_GATEWAYS`, `IPFS_HEDGE_DELAY_MS`) and
+verify bytes before accepting them. Local `ipfs_content` rows are never evicted
+while any `ipfs_pins` entry is not `PINNED`, and `GET /api/v1/admin/status`
+exposes the live replication summary.
+
+## Migrations
+
+### Naming convention
+
+Every new migration folder must start with a 14-digit timestamp prefix (`YYYYMMDDHHMMSS`) followed by `_` and a descriptive slug, e.g. `20261019140000_payment_intents`. The prefix must be **strictly greater** than every existing prefix. Duplicate prefixes break Prisma's lexical ordering and are caught by `npm run lint:migrations`.
+
+### Checking for drift
+
+`npm run check:drift` applies all migrations to a shadow database, then diffs in both directions between the applied schema and `prisma/schema.prisma`. It fails if any object appears in one side but not the other and is not listed in `prisma/drift-allowlist.json`.
+
+Run locally:
+
+```bash
+# auto-creates oracledesk_shadow_<pid> and drops it on exit
+DATABASE_URL=postgresql://... npm run check:drift
+
+# or supply your own shadow DB
+DATABASE_URL=postgresql://... SHADOW_DATABASE_URL=postgresql://...shadow npm run check:drift
+```
+
+### Drift allowlist (`prisma/drift-allowlist.json`)
+
+Objects intentionally managed outside the datamodel (HNSW indexes, partial uniques, the `vector` extension) are listed here with a `reason`. Temporary entries carry an `expires` date; `check:drift` fails once that date has passed to prevent exemptions from going stale.
+
+### Renumbering collision prefixes
+
+The `prisma/migration-renames.json` map lists all historical prefix collisions and their unique replacements. Before deploying to a fresh environment or after a restore, run:
+
+```bash
+# Update _prisma_migrations rows (idempotent — safe to run twice)
+DATABASE_URL=postgresql://... node scripts/renumber-migrations.mjs --apply-db
+
+# Then rename the folders (only needed once per checkout)
+node scripts/renumber-migrations.mjs --apply-fs
+```
+
+**Rollback:** swap `from` and `to` in the map and re-run `--apply-db` on the database, then `--apply-fs` on the checkout. The file contents (and their checksums) are unchanged, so Prisma's integrity check is unaffected.
+
+**Order matters:** run `--apply-db` _before_ `prisma migrate deploy` so the applied-name rows match the folder names.

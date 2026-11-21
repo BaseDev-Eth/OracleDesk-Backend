@@ -237,8 +237,8 @@ export async function verifyTraceOnChain(
     verified,
     contentSource: checked.contentSource ?? 'gateway',
     verifiedAt: new Date(),
-    contentMode: trace.contentMode ?? undefined,
-    plaintextHash: trace.plaintextHash ?? null,
+    contentMode: trace.contentMode,
+    plaintextHash: trace.plaintextHash,
   };
 }
 

@@ -63,36 +63,21 @@ router.get(
   optionalAuth,
   cachePolicy(async (req) => {
     if (!req.headers.authorization) {
-      const trace = (await prisma.reasoningTrace.findUnique({
-        where: { id: req.params.id },
-        select: { onChainTraceId: true, verdict: true } as any,
-      })) as { onChainTraceId: bigint | null; verdict?: string } | null;
-      // #306: never serve non-VALID traces from a shared cache for five minutes.
-      if (trace && trace.onChainTraceId !== null && trace.verdict === 'VALID') {
+      const trace = await prisma.reasoningTrace.findUnique({
+        where: { id: String(req.params.id) },
+        select: { onChainTraceId: true },
+      });
+      if (trace && trace.onChainTraceId !== null) {
         return { kind: 'shared', maxAge: 300, swr: 0 };
       }
     }
     return { kind: 'personalised', maxAge: 0 };
   }),
   validator(async (req) => {
-    const trace = (await prisma.reasoningTrace.findUnique({
-      where: { id: req.params.id },
-      select: {
-        id: true,
-        updatedAt: true,
-        verified: true,
-        onChainTraceId: true,
-        verdict: true,
-        verdictVersion: true,
-      } as any,
-    })) as {
-      id: string;
-      updatedAt: Date;
-      verified: boolean;
-      onChainTraceId: bigint | null;
-      verdict?: string;
-      verdictVersion?: number;
-    } | null;
+    const trace = await prisma.reasoningTrace.findUnique({
+      where: { id: String(req.params.id) },
+      select: { id: true, updatedAt: true, verified: true, onChainTraceId: true },
+    });
     if (!trace) return null;
     return `trace:${trace.id}:${trace.updatedAt.toISOString()}:${trace.verified}:${trace.onChainTraceId ?? ''}:${trace.verdict ?? 'UNKNOWN'}:${trace.verdictVersion ?? 0}`;
   }),
@@ -103,5 +88,7 @@ router.get(
 // Idempotency-Key optional (#123). Lock is 60s by default, above verify's 20s IPFS timeout.
 router.post('/verify', requireAuth, idempotent(), verifyTrace);
 router.post('/:id/unlock', requireAuth, idempotent(), unlockTrace);
+// Envelope data key for a sealed trace (#154); entitled users only, never cached.
+router.get('/:id/key', requireAuth, noStore(), getTraceKey);
 
 export default router;
