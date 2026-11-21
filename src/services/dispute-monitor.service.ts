@@ -24,7 +24,7 @@ import { logger } from '../lib/logger';
 import { resolutionHash, validateResolutionSpec, type ResolutionSpecJson } from '../lib/resolution-spec';
 import { canonicalJson, sha256Hex } from '../utils/hash.util';
 import { AppError } from '../middlewares/error.middleware';
-import { AlertService, type Alert, type AlertLevel } from './alerts.service';
+import { AlertService, type DisputeAlert, type AlertLevel } from './alerts.service';
 import { createLlmEvaluator, type Evaluator, type EvidenceItem, type QuestionDoc } from './dispute-evaluator.service';
 import { fetchIpfsBytes } from './ipfs.service';
 import { agentSigner, baseOptions, readClients, ResolverClient, rpcServer } from './stellar/clients';
@@ -226,7 +226,7 @@ function titleFor(review: DisputeReview, level: AlertLevel, expired: boolean): s
   }
 }
 
-function buildAlert(review: DisputeReview, market: Market | null, level: AlertLevel, now: Date): Alert {
+function buildAlert(review: DisputeReview, market: Market | null, level: AlertLevel, now: Date): DisputeAlert {
   const remaining = windowRemaining(review, now);
   const expired = remaining !== null && remaining <= 0;
   const notes = (review.evidence ?? {}) as ReviewNotes;
@@ -332,7 +332,12 @@ export async function reviewProposal(id: string, deps: MonitorDeps): Promise<Dis
 
   let result;
   try {
-    result = await deps.evaluator.evaluate(doc, new Date(Number(doc.closeTime) * 1000));
+    const deadlineMs = review.windowEndsAt !== null ? Number(review.windowEndsAt) * 1000 : undefined;
+    result = await deps.evaluator.evaluate(
+      doc,
+      new Date(Number(doc.closeTime) * 1000),
+      deadlineMs !== undefined ? { deadlineMs } : undefined,
+    );
   } catch (err) {
     logger.warn({ err: err instanceof Error ? err.message : err, reviewId: id }, 'Dispute review: evaluation failed');
     review = await save(id, {

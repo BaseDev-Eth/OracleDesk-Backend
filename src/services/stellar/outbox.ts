@@ -25,14 +25,14 @@
  */
 import { Keypair, Transaction, TransactionBuilder, rpc } from '@stellar/stellar-sdk';
 import { config } from '../../config';
+import { getChainCache } from '../../lib/chain-cache';
 import { logger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
-import { getRedis } from '../../lib/redis';
-import { withCallerClass } from '../../lib/context';
-import { withTimeout } from '../../lib/resilience';
+import { RedisUnavailableError, getRedis, releaseLock, renewLock } from '../../lib/redis';
 import { readClients, rpcServer } from './clients';
 import { contractErrorName } from './errors';
 import { FeeBumpCapExceeded, buildFeeBump, innerInclusionPerOp, planBump } from './fee-bump';
+import { decideExpiry, type ExpiryDecision } from './timebounds';
 
 export type OutboxStatus = 'BUILT' | 'SIGNED' | 'SUBMITTED' | 'PENDING' | 'SUCCESS' | 'FAILED' | 'EXPIRED';
 
@@ -177,7 +177,99 @@ export interface CompletionOutcome {
   /** Native return value for SUCCESS (e.g. the on-chain market id or shares). */
   value?: unknown;
   txHash?: string | null;
+  ledger?: number | null;
   error?: string | null;
+}
+
+// ─── Write intents & confirmation invalidation (#330) ────────────────────────
+
+const WRITE_INTENT_MARGIN_MS = 15_000;
+const rowIntents = new Map<string, string>();
+
+/** TTL for write intents: inline wait window plus a safety margin. */
+export function writeIntentTtlMs(): number {
+  return config.OUTBOX_INLINE_WAIT_MS + WRITE_INTENT_MARGIN_MS;
+}
+
+function rowArgsObject(args: unknown): Record<string, unknown> {
+  return args && typeof args === 'object' && !Array.isArray(args)
+    ? (args as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Registers a chain-cache write intent for an outbox row once its envelope is
+ * signed and before sendTransaction. Returns the intent token, or null when the
+ * write affects no cached tags.
+ */
+export async function beginWriteIntentForRow(
+  rowId: string,
+  method: string,
+  args: Record<string, unknown>,
+  ttlMs = writeIntentTtlMs(),
+): Promise<string | null> {
+  const tags = tagsForWrite(method, args);
+  if (tags.length === 0) return null;
+  await endWriteIntentForRow(rowId);
+  try {
+    const token = await getChainCache().beginWrite(tags, ttlMs);
+    rowIntents.set(rowId, token);
+    return token;
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId, method }, 'outbox: failed to begin write intent');
+    return null;
+  }
+}
+
+/** Ends any active write intent tracked for an outbox row. Idempotent. */
+export async function endWriteIntentForRow(rowId: string): Promise<void> {
+  const token = rowIntents.get(rowId);
+  if (!token) return;
+  rowIntents.delete(rowId);
+  try {
+    await getChainCache().endWrite(token);
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, rowId }, 'outbox: failed to end write intent');
+  }
+}
+
+/** Extends the write intent while a row remains PENDING during recovery. */
+async function refreshWriteIntentForRow(row: ChainTransactionRow): Promise<void> {
+  if (!row.method) return;
+  await beginWriteIntentForRow(row.id, row.method, rowArgsObject(row.args));
+}
+
+/**
+ * Confirmation hook (#330): invalidates every chain-read cache tag affected by
+ * a confirmed write at its landing ledger, then clears the row's write intent.
+ *
+ * Called for SUCCESS and for FAILED transactions that landed on-chain with a
+ * txHash (a failed transaction still consumed fees and may have altered state
+ * via a fee-bump). Runs before `markHandled`, so a crash re-runs it safely.
+ */
+export async function onConfirmed(row: ChainTransactionRow, outcome: CompletionOutcome): Promise<void> {
+  const shouldInvalidate =
+    outcome.status === 'SUCCESS' ||
+    (outcome.status === 'FAILED' && Boolean(outcome.txHash ?? row.landedHash));
+
+  try {
+    if (shouldInvalidate && row.method) {
+      const returned = outcome.status === 'SUCCESS' ? (outcome.value ?? row.returnValue) : undefined;
+      const tags = tagsForWrite(row.method, rowArgsObject(row.args), returned);
+      const rawLedger = row.ledger ?? outcome.ledger;
+      const atLedger = typeof rawLedger === 'number' && Number.isFinite(rawLedger) && rawLedger > 0
+        ? rawLedger
+        : undefined;
+      if (tags.length > 0) {
+        const cache = getChainCache();
+        await Promise.all(tags.map((tag) => cache.invalidateTag(tag, atLedger)));
+      }
+    }
+  } catch (err) {
+    logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id, method: row.method }, 'outbox: cache invalidation failed');
+  } finally {
+    await endWriteIntentForRow(row.id);
+  }
 }
 
 export type CompletionHandler = (row: ChainTransactionRow, outcome: CompletionOutcome) => Promise<void>;
@@ -185,7 +277,7 @@ export type CompletionHandler = (row: ChainTransactionRow, outcome: CompletionOu
 const handlers = new Map<string, CompletionHandler>();
 
 /** Kinds that must have a handler; resolving one without is an error, never a skip. */
-const DOMAIN_KINDS = new Set(['market.create', 'trade.buy', 'trade.sell', 'trace.publish']);
+export const DOMAIN_KINDS: ReadonlySet<string> = new Set(['market.create', 'trade.buy', 'trade.sell', 'trace.publish']);
 
 /** Registers the idempotent completion handler for one kind (at module load). */
 export function registerHandler(kind: string, handler: CompletionHandler): void {
@@ -193,9 +285,9 @@ export function registerHandler(kind: string, handler: CompletionHandler): void 
 }
 
 /**
- * Runs the kind's handler, then marks the row handled. The handler runs before
- * the mark on purpose: a crash in between re-runs the handler, which must be
- * idempotent; the reverse order would lose the run entirely.
+ * Runs the kind's handler, invalidates affected chain-cache tags, then marks
+ * the row handled. Running handler + invalidation before the mark guarantees
+ * a crash in between re-runs both idempotently.
  */
 export async function runCompletionHandler(
   row: ChainTransactionRow,
@@ -203,15 +295,85 @@ export async function runCompletionHandler(
   store: OutboxStore = prismaOutboxStore(),
 ): Promise<void> {
   if (row.handledAt) return;
-  const handler = handlers.get(row.kind);
-  if (!handler && DOMAIN_KINDS.has(row.kind)) {
-    // The owning module has not loaded (or failed to): leaving the row
-    // unhandled keeps it visible to the next recovery pass instead of
-    // silently dropping the domain update.
-    throw new Error(`no completion handler registered for ${row.kind}`);
+  await trackHandlerRun(row.kind, async () => {
+    const handler = handlers.get(row.kind);
+    if (!handler && DOMAIN_KINDS.has(row.kind)) {
+      // The owning module has not loaded (or failed to): leaving the row
+      // unhandled keeps it visible to the next recovery pass instead of
+      // silently dropping the domain update.
+      throw new Error(`no completion handler registered for ${row.kind}`);
+    }
+    if (handler) await handler(row, outcome);
+    await store.markHandled(row.id);
+  });
+}
+
+// ─── Handler failure streaks (#220) ──────────────────────────────────────────
+
+export interface HandlerStreak {
+  /** Consecutive failed runs for this kind since the last success. */
+  count: number;
+  /** Error class only (name/code): messages can carry XDR. */
+  lastErrorClass: string | null;
+  /** When the current streak started (ISO), null when count is 0. */
+  since: string | null;
+}
+
+const handlerStreaks = new Map<string, HandlerStreak>();
+
+function errorClass(err: unknown): string {
+  if (err instanceof Error) {
+    const code = (err as { code?: unknown }).code;
+    if (typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code)) return code;
+    if (/^no completion handler registered/.test(err.message)) return 'missing_handler';
+    return err.name || 'Error';
   }
-  if (handler) await handler(row, outcome);
-  await store.markHandled(row.id);
+  return typeof err;
+}
+
+/**
+ * Runs one completion-handler attempt and records it in the per-kind streak:
+ * reset on success, incremented on throw (the error is rethrown unchanged).
+ * Wraps every runCompletionHandler call site at once, so recovery, bump and
+ * inline paths all feed the same streak. Per instance, not cluster-wide.
+ */
+async function trackHandlerRun(kind: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    const prev = handlerStreaks.get(kind);
+    handlerStreaks.set(kind, {
+      count: (prev?.count ?? 0) + 1,
+      lastErrorClass: errorClass(err),
+      since: prev && prev.count > 0 ? prev.since : new Date().toISOString(),
+    });
+    throw err;
+  }
+  if (handlerStreaks.get(kind)?.count) handlerStreaks.set(kind, { count: 0, lastErrorClass: null, since: null });
+}
+
+/** Per-kind completion-handler failure streaks on this instance (#220). */
+export function handlerHealth(): { scope: 'instance'; kinds: Record<string, HandlerStreak> } {
+  return { scope: 'instance', kinds: Object.fromEntries([...handlerStreaks].map(([k, v]) => [k, { ...v }])) };
+}
+
+/** Visible for tests: forget handler streaks. */
+export function clearHandlerStreaksForTest(): void {
+  handlerStreaks.clear();
+}
+
+/**
+ * The outcome a terminal row's handler receives when it is re-run from the
+ * stored row (no RPC): the same reconstruction as recoverInFlight's unhandled
+ * sweep. Used by the admin console's rerun-handler (#221).
+ */
+export function completionOutcomeFor(row: ChainTransactionRow): CompletionOutcome {
+  return {
+    status: row.status as 'SUCCESS' | 'FAILED' | 'EXPIRED',
+    value: row.status === 'SUCCESS' ? row.returnValue : undefined,
+    txHash: row.landedHash ?? row.hash,
+    error: row.error,
+  };
 }
 
 /** Visible for tests: forget registered handlers. */
@@ -316,6 +478,8 @@ export interface RecoverDeps {
   ledgerOverride?: number;
   feePayer?: Keypair;
   signedGraceMs?: number;
+  /** Redis holding the per-row leases (#221); defaults to the shared client. */
+  leaseRedis?: LeaseRedis;
 }
 
 export interface RecoveryStats {
@@ -367,9 +531,86 @@ export function parseReturnValue(row: Pick<ChainTransactionRow, 'contract' | 'me
   }
 }
 
-/** Expiry by timebounds: NOT_FOUND past maxTime (plus skew) can never land. */
-function isPastMaxTime(row: ChainTransactionRow, nowSecs: number, skewSecs = 60): boolean {
-  return row.maxTime != null && BigInt(nowSecs) > row.maxTime + BigInt(skewSecs);
+// ─── Ledger-time expiry (#221) ───────────────────────────────────────────────
+
+/** Seconds past maxTime (by ledger close time) before NOT_FOUND may count as expired. */
+export const OUTBOX_EXPIRY_SKEW_SECONDS = 60;
+
+/** The ledger/retention fields every getTransaction response carries. */
+export interface RetentionFields {
+  latestLedger?: number | string | null;
+  latestLedgerCloseTime?: number | string | null;
+  oldestLedger?: number | string | null;
+  oldestLedgerCloseTime?: number | string | null;
+}
+
+export interface LedgerExpiry {
+  decision: ExpiryDecision;
+  /** Operator-facing explanation; stored as the row error when UNKNOWN. */
+  reason: string;
+  latestLedgerCloseTime: number | null;
+  oldestLedger: number | null;
+  maxTime: string | null;
+  submitLedger: number | null;
+}
+
+function num(value: unknown): number | null {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Whether a row whose every hash is NOT_FOUND can no longer land, decided by
+ * {@link decideExpiry} from ledger close time and RPC retention instead of the
+ * host clock: EXPIRED only when the latest ledger closed past maxTime + skew
+ * AND the submission ledger is still inside the RPC retention window (else a
+ * landing could have been pruned from RPC history, so the answer is UNKNOWN).
+ * Rows without maxTime (written before #42) or without submitLedger can never
+ * be proven expired. Shared by the recovery worker and the admin abandon.
+ */
+export function ledgerExpiry(
+  row: Pick<ChainTransactionRow, 'maxTime' | 'submitLedger'>,
+  resp: RetentionFields,
+  skewSeconds = OUTBOX_EXPIRY_SKEW_SECONDS,
+): LedgerExpiry {
+  const latestLedgerCloseTime = num(resp.latestLedgerCloseTime);
+  const oldestLedger = num(resp.oldestLedger);
+  const base = {
+    latestLedgerCloseTime,
+    oldestLedger,
+    maxTime: row.maxTime != null ? row.maxTime.toString() : null,
+    submitLedger: row.submitLedger,
+  };
+  if (row.maxTime == null) {
+    return { ...base, decision: 'UNKNOWN', reason: 'expiry unprovable: row has no maxTime (written before timebounds, #42)' };
+  }
+  if (latestLedgerCloseTime == null) {
+    return { ...base, decision: 'PENDING', reason: 'RPC did not report the latest ledger close time' };
+  }
+  const decision = decideExpiry({
+    status: 'NOT_FOUND',
+    latestLedgerCloseTime,
+    maxTime: Number(row.maxTime),
+    skewSeconds,
+    submittedLedger: row.submitLedger,
+    oldestLedger,
+    oldestLedgerCloseTime: num(resp.oldestLedgerCloseTime),
+  });
+  let reason: string;
+  switch (decision) {
+    case 'EXPIRED':
+      reason = `ledger close time ${latestLedgerCloseTime} is past maxTime ${row.maxTime} + ${skewSeconds}s and submit ledger ${row.submitLedger} is inside RPC retention (oldest ${oldestLedger})`;
+      break;
+    case 'PENDING':
+      reason = `ledger close time ${latestLedgerCloseTime} is not past maxTime ${row.maxTime} + ${skewSeconds}s`;
+      break;
+    default:
+      reason = row.submitLedger == null
+        ? 'expiry unprovable: submitLedger is unknown, so RPC retention cannot cover the submission'
+        : `expiry unprovable: submit ledger ${row.submitLedger} is older than the RPC retention floor ${oldestLedger ?? 'unknown'}`;
+  }
+  return { ...base, decision, reason };
 }
 
 /** Resolves one row against chain state. Exposed for the indexer hook. */
@@ -397,10 +638,10 @@ export async function recoverRow(
 
   const hashes = [row.hash, ...(row.feeBumpHashes ?? [])];
   let landed: { hash: string; status: 'SUCCESS' | 'FAILED'; resp: rpc.Api.GetTransactionResponse } | null = null;
+  let lastResp: RetentionFields = {};
   for (const hash of hashes) {
-    const resp = await withCallerClass('agent', () =>
-      withTimeout('rpc-confirm', () => server.getTransaction(hash)),
-    );
+    const resp = await server.getTransaction(hash);
+    lastResp = resp as RetentionFields;
     if (resp.status === 'SUCCESS' || resp.status === 'FAILED') {
       landed = { hash, status: resp.status, resp };
       break;
@@ -418,15 +659,19 @@ export async function recoverRow(
       });
       if (moved) {
         await applyLandedHash(moved, landed.hash);
-        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash }, store);
+        await runCompletionHandler(moved, { status: 'SUCCESS', value, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
     } else {
       const error = contractErrorName((row.contract ?? 'treasury') as BindingContract, landed.resp) ?? 'transaction failed on-chain';
-      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', { landedHash: landed.hash, error });
+      const moved = await store.transition(row.id, [...IN_FLIGHT], 'FAILED', {
+        landedHash: landed.hash,
+        ledger: anyResp.ledger ?? null,
+        error,
+      });
       if (moved) {
-        await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash }, store);
+        await runCompletionHandler(moved, { status: 'FAILED', error, txHash: landed.hash, ledger: anyResp.ledger ?? moved.ledger }, store);
         stats.resolved++;
         stats.handled++;
       }
@@ -434,8 +679,17 @@ export async function recoverRow(
     return stats;
   }
 
-  // NOT_FOUND everywhere. Past the timebounds nothing can land any more.
-  if (isPastMaxTime(row, nowSecs)) {
+  // NOT_FOUND everywhere. Past the timebounds nothing can land any more,
+  // judged by ledger close time and RPC retention, never the host clock (#221).
+  const expiry = ledgerExpiry(row, lastResp);
+  if (expiry.decision === 'UNKNOWN' && row.maxTime != null) {
+    // Past maxTime by ledger time but a landing could be outside RPC history:
+    // leave the row in flight with the reason for an operator. A SIGNED row
+    // still resubmits below (the network decides; a rejection is final).
+    if (row.error !== expiry.reason) await store.recordError(row.id, expiry.reason);
+    if (row.status !== 'SIGNED') return stats;
+  }
+  if (expiry.decision === 'EXPIRED') {
     const moved = await store.transition(row.id, [...IN_FLIGHT], 'EXPIRED', { error: 'expired by timebounds' });
     if (moved) {
       await runCompletionHandler(moved, { status: 'EXPIRED', txHash: row.hash }, store);
@@ -443,6 +697,11 @@ export async function recoverRow(
       stats.handled++;
     }
     return stats;
+  }
+
+  // Row is still in-flight: extend its write intent while pending (#330).
+  if (row.status === 'PENDING' || row.status === 'SUBMITTED') {
+    await refreshWriteIntentForRow(row);
   }
 
   // Crash between sign and send: the stored envelope resubmits byte-for-byte,
@@ -491,14 +750,19 @@ export async function recoverRow(
  * for terminal rows a crash left unhandled, and fee-bump stuck submissions.
  */
 export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryStats> {
-  return withCallerClass('agent', async () => {
-    const store = deps.store ?? prismaOutboxStore();
-    const stats: RecoveryStats = { resolved: 0, resubmitted: 0, expired: 0, handled: 0, bumped: 0 };
-    const now = deps.now ? new Date(deps.now() * 1000) : new Date();
+  const store = deps.store ?? prismaOutboxStore();
+  const stats: RecoveryStats = { resolved: 0, resubmitted: 0, expired: 0, handled: 0, bumped: 0 };
+  const now = deps.now ? new Date(deps.now() * 1000) : new Date();
+  // Per-row lease shared with the admin console (#221). The worker fails open
+  // when Redis is down: admin actions fail closed then, so nothing can race it.
+  const lease = { redis: deps.leaseRedis, failOpen: true };
 
-    // Crash between a terminal transition and its handler: run the handler now.
-    for (const row of await store.findUnhandled()) {
+  // Crash between a terminal transition and its handler: run the handler now.
+  for (const listed of await store.findUnhandled()) {
+    const leased = await withRowLease(listed.id, async () => {
       try {
+        const row = await freshRow(store, listed, (r) => TERMINAL_STATUSES.includes(r.status as OutboxStatus) && !r.handledAt);
+        if (!row) return;
         await runCompletionHandler(
           row,
           {
@@ -511,19 +775,25 @@ export async function recoverInFlight(deps: RecoverDeps = {}): Promise<RecoveryS
         );
         stats.handled++;
       } catch (err) {
-        logger.error({ err, outboxId: row.id, kind: row.kind }, 'outbox: completion handler failed; will retry');
+        logger.error({ err, outboxId: listed.id, kind: listed.kind }, 'outbox: completion handler failed; will retry');
       }
-    }
+    }, lease);
+    if (leased === 'BUSY') logger.debug({ outboxId: listed.id }, 'outbox: row leased elsewhere; skipped this pass');
+  }
 
-    for (const row of await store.findInFlight(now, deps.signedGraceMs ?? SIGNED_GRACE_MS)) {
+  for (const listed of await store.findInFlight(now, deps.signedGraceMs ?? SIGNED_GRACE_MS)) {
+    const leased = await withRowLease(listed.id, async () => {
       try {
+        const row = await freshRow(store, listed, (r) => r.status === listed.status);
+        if (!row) return;
         await recoverRow(row, { ...deps, store }, stats);
       } catch (err) {
-        logger.warn({ err: err instanceof Error ? err.message : err, outboxId: row.id }, 'outbox: recovery of one row failed; next pass retries');
+        logger.warn({ err: err instanceof Error ? err.message : err, outboxId: listed.id }, 'outbox: recovery of one row failed; next pass retries');
       }
-    }
-    return stats;
-  });
+    }, lease);
+    if (leased === 'BUSY') logger.debug({ outboxId: listed.id }, 'outbox: row leased elsewhere; skipped this pass');
+  }
+  return stats;
 }
 
 /**
@@ -592,8 +862,10 @@ async function bumpRow(
         withTimeout('rpc-confirm', () => server.getTransaction(row.hash!)),
       );
       if (recheck.status === 'SUCCESS' || recheck.status === 'FAILED') {
+        const recheckLedger = (recheck as { ledger?: number }).ledger ?? null;
         const moved = await store.transition(row.id, [...IN_FLIGHT], recheck.status === 'SUCCESS' ? 'SUCCESS' : 'FAILED', {
           landedHash: row.hash,
+          ledger: recheckLedger,
         });
         if (moved) {
           await runCompletionHandler(
@@ -602,6 +874,7 @@ async function bumpRow(
               status: recheck.status,
               value: recheck.status === 'SUCCESS' ? parseReturnValue(row, (recheck as { returnValue?: unknown }).returnValue) : undefined,
               txHash: row.hash,
+              ledger: recheckLedger,
             },
             store,
           );
@@ -613,6 +886,94 @@ async function bumpRow(
   }
   logger.info({ hash: row.hash, outerHash, fee: String(outer.fee) }, 'fee bump submitted');
   return true;
+}
+
+// ─── Per-row lease (#221) ────────────────────────────────────────────────────
+
+/**
+ * Lease TTL. Renewed every third of it while the holder runs, so an action
+ * that outlives it (RPC timeouts plus a fee bump) keeps the row; a crashed
+ * holder blocks the row for at most one TTL.
+ */
+export const ROW_LEASE_TTL_MS = 30_000;
+
+export type LeaseRedis = Pick<ReturnType<typeof getRedis>, 'set' | 'eval'>;
+
+let leaseRedisForTest: LeaseRedis | null = null;
+
+/** Visible for tests: route every row lease through this client (null resets). */
+export function setRowLeaseRedisForTest(redis: LeaseRedis | null): void {
+  leaseRedisForTest = redis;
+}
+
+export function rowLeaseKey(id: string): string {
+  return `outbox:row:${id}`;
+}
+
+export interface RowLeaseOptions {
+  redis?: LeaseRedis;
+  ttlMs?: number;
+  /**
+   * When Redis is unavailable: false (default, admin actions) throws
+   * RedisUnavailableError so the caller fails closed; true (the worker) runs
+   * fn without a lease, relying on the compare-and-set transitions.
+   */
+  failOpen?: boolean;
+}
+
+/**
+ * Runs fn while holding the per-row lease `outbox:row:<id>`, shared by the
+ * recovery worker and the admin console so they never process the same row
+ * at the same moment. Returns 'BUSY' without running fn when another holder
+ * has it. The lease is a single non-waiting `SET NX PX` with an unpredictable
+ * token, renewed with renewLock and released with releaseLock
+ * (compare-and-delete); acquireLock's FIFO waiter queue is not used because
+ * neither caller waits for a busy row.
+ */
+export async function withRowLease<T>(id: string, fn: () => Promise<T>, opts: RowLeaseOptions = {}): Promise<T | 'BUSY'> {
+  const redis = (opts.redis ?? leaseRedisForTest ?? getRedis()) as ReturnType<typeof getRedis>;
+  const ttlMs = opts.ttlMs ?? ROW_LEASE_TTL_MS;
+  const key = rowLeaseKey(id);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  let acquired: boolean;
+  try {
+    acquired = (await redis.set(key, token, 'PX', ttlMs, 'NX')) === 'OK';
+  } catch (err) {
+    if (!opts.failOpen) {
+      throw err instanceof RedisUnavailableError ? err : new RedisUnavailableError('Redis is unavailable for the outbox row lease', err);
+    }
+    logger.debug({ err: err instanceof Error ? err.message : err, outboxId: id }, 'outbox: row lease unavailable; proceeding unleased');
+    return fn();
+  }
+  if (!acquired) return 'BUSY';
+
+  const renew = setInterval(() => {
+    renewLock(key, token, ttlMs, redis)
+      .then((held) => {
+        if (!held) logger.warn({ outboxId: id }, 'outbox: row lease lost while still processing');
+      })
+      .catch(() => undefined);
+  }, Math.max(50, Math.floor(ttlMs / 3)));
+  renew.unref?.();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(renew);
+    await releaseLock(key, token, redis).catch(() => undefined);
+  }
+}
+
+/**
+ * Re-reads a listed row under its lease: another holder may have moved it
+ * between the listing and the lease. Null when it no longer qualifies.
+ */
+async function freshRow(
+  store: OutboxStore,
+  listed: ChainTransactionRow,
+  qualifies: (row: ChainTransactionRow) => boolean,
+): Promise<ChainTransactionRow | null> {
+  const row = (await store.findById(listed.id)) ?? null;
+  return row && qualifies(row) ? row : null;
 }
 
 // ─── Worker ──────────────────────────────────────────────────────────────────
@@ -660,6 +1021,13 @@ async function loadCompletionHandlers(): Promise<void> {
   ]);
 }
 
+let workerRunning = false;
+
+/** True between startOutboxWorker() and its stop function (#220 chain-writer detection). */
+export function outboxWorkerRunning(): boolean {
+  return workerRunning;
+}
+
 /**
  * Starts the recovery worker: one pass immediately (resolving whatever a
  * previous process left in flight), then every OUTBOX_POLL_MS. Returns a stop
@@ -686,9 +1054,11 @@ export function startOutboxWorker(deps: RecoverDeps = {}): () => void {
     if (!stopped) timer = setTimeout(tick, config.OUTBOX_POLL_MS);
   };
   void tick();
+  workerRunning = true;
   logger.info({ pollMs: config.OUTBOX_POLL_MS }, 'outbox recovery worker started');
   return () => {
     stopped = true;
+    workerRunning = false;
     if (timer) clearTimeout(timer);
   };
 }

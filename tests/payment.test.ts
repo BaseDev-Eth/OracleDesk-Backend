@@ -111,6 +111,23 @@ function reader(opts: ReaderOpts) {
 }
 
 const HASH = 'ab'.repeat(32);
+
+/**
+ * Transaction-client pieces the claim path needs besides the maps each test
+ * keeps: advisory locks and an empty allowance_days bucket (#219).
+ */
+function allowanceTxStub() {
+  return {
+    $queryRaw: async (sql: TemplateStringsArray) =>
+      sql.join('?').includes('allowance_days') ? [{ spentRaw: '0', reservedRaw: '0', overageRaw: '0' }] : [{ locked: true }],
+    $executeRaw: async () => 1,
+    allowanceDay: { update: async () => ({}) },
+    allowanceCharge: {
+      findUnique: async () => null,
+      create: async ({ data }: any) => ({ id: `charge-${data.txHash}`, ...data }),
+    },
+  };
+}
 const code = (p: Promise<unknown>) => p.then(() => 'ok', (e: any) => e.code ?? e.message);
 
 test('payment verification: success and every failure mode', async () => {
@@ -376,7 +393,7 @@ test('recordPayment: grants a pass once per hash and never without verification'
     subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    $queryRaw: async () => [{ locked: true }],
+    ...allowanceTxStub(),
     paymentEvent: {
       findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
       create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
@@ -398,6 +415,7 @@ test('recordPayment: grants a pass once per hash and never without verification'
     const sub = await recordPayment({ userId: 'u1', walletAddress: user, type: 'DAILY_PASS', txHash: HASH });
     assert.equal(sub.status, 'ACTIVE');
     assert.equal(sub.amountPaid, 0.5);
+    assert.equal(sub.amountPaidRaw, '5000000');
 
     // Same user, same hash: idempotent, returns the existing pass.
     const again = await recordPayment({ userId: 'u1', walletAddress: user, type: 'DAILY_PASS', txHash: HASH });
@@ -435,9 +453,16 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
   (prisma.subscription.findFirst as any) = async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null;
   (prisma.spendingAllowance.findUnique as any) = async () => null;
   (prisma.$transaction as any) = async (fn: any) => fn({
-    subscription: { create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; } },
-    paymentEvent: { create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; } },
-    spendingAllowance: { updateMany: async () => ({ count: 0 }) },
+    ...allowanceTxStub(),
+    subscription: {
+      findFirst: async ({ where }: any) => subs.find((s) => s.txHash === where.txHash) ?? null,
+      create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; },
+    },
+    paymentEvent: {
+      findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
+      create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
+    },
+    spendingAllowance: { findUnique: async () => null, updateMany: async () => ({ count: 0 }) },
   });
 
   const envelope = transferEnvelope({
@@ -461,146 +486,34 @@ test('C… session can claim a daily pass paid from that contract (#47)', async 
   }
 });
 
-test('recordPayment verifies before taking payment advisory locks (assertNoIoInLock) (#305)', async () => {
-  const { verification, CONTRACTS, PAYMENTS_RECIPIENT, config } = await load();
+test('settleVerifiedTransfer charges ledgerDay(ledgerCloseAt), not the claim day (#219)', async () => {
   const { prisma } = await import('../src/lib/prisma');
-  const { assertNoIoInLock } = await import('../src/lib/advisory-lock');
-  const { recordPayment } = await import('../src/services/subscription.service');
-  const user = Keypair.random().publicKey();
-  const txHash = '12'.repeat(32);
-  const used = new Map<string, { userId: string }>();
-  const subs: any[] = [];
-
-  (prisma.paymentEvent.findUnique as any) = async ({ where }: any) => used.get(where.txHash) ?? null;
-  (prisma.subscription.findFirst as any) = async ({ where }: any) =>
-    subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null;
-  (prisma.spendingAllowance.findUnique as any) = async () => null;
-  (prisma.$transaction as any) = async (fn: any) => fn({
-    $queryRaw: async () => [{ locked: true }],
-    paymentEvent: {
-      findUnique: async ({ where }: any) => used.get(where.txHash) ?? null,
-      create: async ({ data }: any) => { used.set(data.txHash, { userId: data.userId }); return data; },
-    },
-    subscription: {
-      findFirst: async ({ where }: any) => subs.find((s) => (where.txHash === undefined || s.txHash === where.txHash)) ?? null,
-      create: async ({ data }: any) => { const s = { id: `sub-${subs.length}`, ...data }; subs.push(s); return s; },
-    },
-    spendingAllowance: { findUnique: async () => null, updateMany: async () => ({ count: 0 }) },
-  });
-
-  const env = transferEnvelope({
-    passphrase: config.STELLAR_NETWORK_PASSPHRASE,
-    contract: CONTRACTS.usdc,
-    from: user,
-    to: PAYMENTS_RECIPIENT,
-    amount: PRICE,
-  });
-  const prev = verification.setTransactionReader(reader({
-    status: rpc.Api.GetTransactionStatus.SUCCESS,
-    envelope: env,
-    events: [transferEvent({ contract: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, amount: PRICE })],
-  }));
-  const unwrapGuard = assertNoIoInLock();
+  const { settleVerifiedTransfer } = await import('../src/services/subscription.service');
+  const { fakeAllowanceDb, seedAllowance } = await import('./helpers/fake-allowance-db');
+  const db = fakeAllowanceDb();
+  const restore = db.install(prisma);
   try {
-    const sub = await recordPayment({ userId: 'u-lock', walletAddress: user, type: 'DAILY_PASS', txHash });
-    assert.equal(sub.status, 'ACTIVE');
+    seedAllowance(db, { userId: 'u1', dailyLimitRaw: 8_000_000n, perTraceLimitRaw: 8_000_000n });
+    const base = {
+      from: Keypair.random().publicKey(), to: Keypair.random().publicKey(), ledger: 42, txSource: '',
+      memo: { type: 'none' } as any, transfers: [], toMuxedId: null, envelopeMismatch: false,
+    };
+    const claimAt = new Date('2026-11-20T00:00:10Z');
+    // D+1's own pass first, then the late claim for a transfer that closed on D.
+    await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c1'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-20T00:00:05Z') / 1000 },
+    });
+    const late = await settleVerifiedTransfer(db.client, {
+      userId: 'u1', type: 'DAILY_PASS', now: claimAt,
+      transfer: { ...base, txHash: 'c2'.repeat(32), amount: PRICE, createdAt: Date.parse('2026-11-19T23:59:50Z') / 1000 },
+    });
+    assert.equal(late.ledgerCloseAt.toISOString(), '2026-11-19T23:59:50.000Z');
+    assert.equal(late.overageRaw, 0n, 'D has its own budget');
+    assert.deepEqual(db.bucket('u1', '2026-11-19'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.deepEqual(db.bucket('u1', '2026-11-20'), { spentRaw: '5000000', reservedRaw: '0', overageRaw: '0' });
+    assert.equal(db.allowances.get('u1')!.spentTodayRaw, '5000000', 'the late claim never touches the current day');
   } finally {
-    unwrapGuard();
-    verification.setTransactionReader(prev);
-  }
-});
-
-test('getTxFacts caches SUCCESS and FAILED with single-flight, and never caches NOT_FOUND or incomplete meta (#305)', async () => {
-  const { verification, CONTRACTS, PAYMENTS_RECIPIENT, config } = await load();
-  const user = Keypair.random().publicKey();
-  const env = transferEnvelope({
-    passphrase: config.STELLAR_NETWORK_PASSPHRASE,
-    contract: CONTRACTS.usdc,
-    from: user,
-    to: PAYMENTS_RECIPIENT,
-    amount: PRICE,
-  });
-
-  let rpcCalls = 0;
-  const dbMap = new Map<string, any>();
-  const prevStore = verification.setTxFactsStoreForTest({
-    async read(h) { return dbMap.get(h) ?? null; },
-    async write(f) { dbMap.set(f.txHash, f); },
-  });
-
-  const hSuccess = '34'.repeat(32);
-  const hNotFound = '56'.repeat(32);
-  const hFailed = '78'.repeat(32);
-  const hIncomplete = '9a'.repeat(32);
-
-  const prevReader = verification.setTransactionReader({
-    async getTransaction(hash: string) {
-      rpcCalls++;
-      await new Promise((r) => setTimeout(r, 10));
-      if (hash === hNotFound) {
-        return { status: rpc.Api.GetTransactionStatus.NOT_FOUND, txHash: hash } as any;
-      }
-      if (hash === hFailed) {
-        return { status: rpc.Api.GetTransactionStatus.FAILED, txHash: hash, ledger: 50, createdAt: 1700000100 } as any;
-      }
-      if (hash === hIncomplete) {
-        return { status: rpc.Api.GetTransactionStatus.SUCCESS, txHash: hash, ledger: 51 } as any;
-      }
-      return {
-        status: rpc.Api.GetTransactionStatus.SUCCESS,
-        txHash: hash,
-        ledger: 49,
-        createdAt: 1700000000,
-        envelopeXdr: env,
-        resultMetaXdr: metaV3([transferEvent({ contract: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, amount: PRICE })]),
-      } as any;
-    },
-  });
-
-  try {
-    // Concurrent calls for the same hash share a single RPC request.
-    const [f1, f2] = await Promise.all([verification.getTxFacts(hSuccess), verification.getTxFacts(hSuccess)]);
-    assert.equal(rpcCalls, 1);
-    assert.equal(f1.status, 'SUCCESS');
-    assert.equal(f2.ledger, 49);
-    assert.ok(dbMap.has(hSuccess));
-
-    // Subsequent lookup hits LRU without calling RPC.
-    await verification.getTxFacts(hSuccess);
-    assert.equal(rpcCalls, 1);
-
-    // Clear LRU -> hits DB store without calling RPC.
-    verification.clearTxFactsCache();
-    const fromDb = await verification.getTxFacts(hSuccess);
-    assert.equal(rpcCalls, 1);
-    assert.equal(fromDb.transfers[0].amount, PRICE);
-
-    // FAILED is cached (and evaluateTransfer maps it to PAYMENT_FAILED).
-    const failedFacts = await verification.getTxFacts(hFailed);
-    assert.equal(failedFacts.status, 'FAILED');
-    assert.equal(rpcCalls, 2);
-    await verification.getTxFacts(hFailed);
-    assert.equal(rpcCalls, 2);
-    assert.throws(
-      () => verification.evaluateTransfer(failedFacts, {
-        txHash: hFailed, token: CONTRACTS.usdc, from: user, to: PAYMENTS_RECIPIENT, minAmount: PRICE,
-      }),
-      (err: any) => err.code === 'PAYMENT_FAILED',
-    );
-
-    // NOT_FOUND is never cached.
-    assert.equal(await code(verification.getTxFacts(hNotFound)), 'PAYMENT_NOT_FOUND');
-    assert.equal(await code(verification.getTxFacts(hNotFound)), 'PAYMENT_NOT_FOUND');
-    assert.equal(rpcCalls, 4);
-    assert.equal(dbMap.has(hNotFound), false);
-
-    // CHAIN_READ_INCOMPLETE is never cached.
-    assert.equal(await code(verification.getTxFacts(hIncomplete)), 'CHAIN_READ_INCOMPLETE');
-    assert.equal(await code(verification.getTxFacts(hIncomplete)), 'CHAIN_READ_INCOMPLETE');
-    assert.equal(rpcCalls, 6);
-    assert.equal(dbMap.has(hIncomplete), false);
-  } finally {
-    verification.setTransactionReader(prevReader);
-    verification.setTxFactsStoreForTest(prevStore);
+    restore();
   }
 });

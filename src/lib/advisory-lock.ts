@@ -29,11 +29,14 @@ export interface AdvisoryLockWaitOptions {
  * The lock is released when the transaction commits or rolls back, and by
  * Postgres when the connection dies, so a crashed holder can never block a
  * key forever.
+ *
+ * `isolationLevel` (e.g. RepeatableRead) makes every query `fn` runs through
+ * `tx` see the one snapshot taken by the lock statement (#222).
  */
 export async function withAdvisoryLock<T>(
   key: string,
   fn: (tx: Prisma.TransactionClient) => Promise<T>,
-  opts: { timeoutMs?: number; maxWaitMs?: number } = {},
+  opts: { timeoutMs?: number; maxWaitMs?: number; isolationLevel?: Prisma.TransactionIsolationLevel } = {},
 ): Promise<{ acquired: true; value: T } | { acquired: false }> {
   return prisma.$transaction(
     async (tx) => {
@@ -47,7 +50,11 @@ export async function withAdvisoryLock<T>(
         logger.debug({ key, holderDurationMs: Date.now() - heldAt }, 'advisory lock released');
       }
     },
-    { timeout: opts.timeoutMs ?? 10 * 60_000, maxWait: opts.maxWaitMs ?? 5_000 },
+    {
+      timeout: opts.timeoutMs ?? 10 * 60_000,
+      maxWait: opts.maxWaitMs ?? 5_000,
+      ...(opts.isolationLevel ? { isolationLevel: opts.isolationLevel } : {}),
+    },
   );
 }
 

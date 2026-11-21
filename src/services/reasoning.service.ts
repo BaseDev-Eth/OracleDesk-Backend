@@ -2,23 +2,15 @@ import { prisma } from '../lib/prisma';
 import { callLLMStructured } from '../lib/llm';
 import { LlmBudgetExceeded, type CallContext } from '../lib/llm-budget';
 import { traceReasoningSchema, traceReasoningSpec } from '../lib/llm-schema';
-import { hedgeConditionsV1 } from '../lib/prompts';
+import { hedgeConditionsV2 } from '../lib/prompts';
 import {
-  buildTraceProvenance,
-  type CitationCheckProvenance,
-  type LlmProvenance,
-  type ProvenanceEntry,
-} from '../lib/llm/provenance';
-import { writeAgentLog } from '../lib/agent-log';
-import { sha256Hex } from '../utils/hash.util';
-import { partitionSignals, renderUntrustedBlock, sanitizeSignal } from './llm-guard.service';
-import { canonicalUrl } from './signal-normalize';
-import {
-  parseFredNumeric,
-  remediateHedgeConditions,
-  type CitationSource,
-} from './citation-validator.service';
+  validateAndGroundPredicates,
+  type HedgePredicate,
+} from '../schemas/hedge-predicate';
+import { buildTraceProvenance, type ProvenanceEntry } from '../lib/llm/provenance';
+import { renderUntrustedBlock, sanitizeSignal } from './llm-guard.service';
 import { logger } from '../lib/logger';
+import crypto from 'node:crypto';
 import { Prisma } from '@prisma/client';
 import type {
   AggregatedSignal,
@@ -42,22 +34,21 @@ export { traceReasoningSchema };
  * 4. Record provenance (#66): who produced the market proposal/forecast (when the
  *    caller passes it) and the hedge conditions, as `tracePayload.provenance`.
  *    It is part of the pinned bytes, so it is committed with the trace.
- * 5. Persist to DB. The hash is computed later, over the exact bytes pinned
- *    to IPFS (services/trace-publish.service.ts), never over this object.
+ * 5. Build the TraceDocV2 document (#227) and persist the row under the same
+ *    pre-allocated id. The document is final: callers enqueue it unchanged and
+ *    the hash is computed later, over the exact bytes pinned to IPFS
+ *    (services/trace-publish.service.ts).
+ *
+ * `market.onChainId` records what was known when the decision was made (null
+ * for most market-creation traces) and is never updated. The registry entry's
+ * market_id, read by the publication worker at publish time, is the
+ * authoritative link (docs/trace-format.md §3b).
  */
 export async function generateReasoningTrace(
   input: TraceInput,
   ctxOrOpts: CallContext | { upstreamProvenance?: ProvenanceEntry[] } = { purpose: 'trace_hedge', priority: 'cron' },
   opts: { upstreamProvenance?: ProvenanceEntry[] } = {},
-) {
-  const isOptsArg = 'upstreamProvenance' in ctxOrOpts && !('purpose' in ctxOrOpts);
-  const ctx: CallContext = isOptsArg
-    ? { purpose: 'trace_hedge', priority: 'cron' }
-    : (ctxOrOpts as CallContext);
-  const resolvedOpts: { upstreamProvenance?: ProvenanceEntry[] } = isOptsArg
-    ? (ctxOrOpts as { upstreamProvenance?: ProvenanceEntry[] })
-    : opts;
-
+): Promise<{ trace: ReasoningTrace; tracePayload: TraceDocV2 }> {
   const edge = calculateEdge(input.probabilityEstimate, input.marketProbability);
   // A forecast-driven decision (#75) already has a calibrated interval; the
   // jackknife over sourcesUsed would only echo the signals' rawValues.
@@ -79,18 +70,20 @@ export async function generateReasoningTrace(
     decisionType:        input.decisionType,
     marketId:            input.marketId,
     sourcesUsed:         input.sourcesUsed,
-    ...(input.citedSourceIds !== undefined ? { citedSourceIds: input.citedSourceIds } : {}),
     probabilityEstimate: input.probabilityEstimate,
     marketProbability:   input.marketProbability,
     edge,
     confidenceInterval:  ci,
-    betFraction:         input.betFraction ?? null,
-    betSizeUsdc:         input.betSizeUsdc ?? null,
-    ...(input.correlation ? { correlation: input.correlation } : {}),
-    ...(input.seedPolicy ? { seedPolicy: input.seedPolicy } : {}),
-    ...(input.forecast ? { forecast: input.forecast } : {}),
-    ...(input.sizing ? { sizing: input.sizing } : {}),
+    betFraction:         input.betFraction,
+    betSizeUsdc:         input.betSizeUsdc,
+    correlation:         input.correlation,
+    seedPolicy:          input.seedPolicy,
+    forecast:            input.forecast,
+    sizing:              input.sizing,
+    // #223: which source weight set scored the evidence; absent on older traces.
+    sourceWeightSet:     input.sourceWeightSet,
     hedgeConditions:     hedgeConditions.conditions,
+    hedgePredicates:     hedgeConditions.predicates,
     provenance,
     agentWallet:         input.agentWallet ?? null,
     timestamp:           clockNow().toISOString(),
@@ -106,28 +99,30 @@ export async function generateReasoningTrace(
 
   const trace = await prisma.reasoningTrace.create({
     data: {
-      marketId:               input.marketId,
-      agentType:              input.agentType,
-      decisionType:           input.decisionType,
-      sourcesUsed:            input.sourcesUsed as any,
-      probabilityEstimate:    input.probabilityEstimate,
+      marketId:            input.marketId,
+      agentType:           input.agentType,
+      decisionType:        input.decisionType,
+      sourcesUsed:         input.sourcesUsed as Prisma.InputJsonValue,
+      probabilityEstimate: input.probabilityEstimate,
       rawProbabilityEstimate: input.rawProbabilityEstimate ?? input.probabilityEstimate,
       marketProbability:      input.marketProbability,
       edge,
-      confidenceInterval:     ci as Prisma.InputJsonValue,
-      betFraction:            input.betFraction ?? null,
-      betSizeUsdc:            input.betSizeUsdc ?? null,
-      hedgeConditions:        hedgeConditions.conditions as any,
-      provenance:             provenance as unknown as Prisma.InputJsonValue,
-      agentWallet:            input.agentWallet,
-      previewSources:         previewSources as any,
-      verified:               false,
-      isPublic:               false,
+      confidenceInterval:  ci as Prisma.InputJsonValue,
+      betFraction:         input.betFraction ?? null,
+      betSizeUsdc:         input.betSizeUsdc ?? null,
+      hedgeConditions:     hedgeConditions.conditions as Prisma.InputJsonValue,
+      hedgePredicates:     hedgeConditions.predicates as unknown as Prisma.InputJsonValue,
+      provenance:          provenance as unknown as Prisma.InputJsonValue,
+      agentWallet:         input.agentWallet,
+      sourceWeightSetVersion: input.sourceWeightSet?.version ?? null,
+      previewSources:      previewSources as any,
+      verified:            false,
+      isPublic:            false,
     },
   });
 
   logger.info({ traceId: trace.id, edge, marketId: input.marketId }, 'Reasoning trace generated');
-  return { trace, tracePayload };
+  return { trace, tracePayload: { ...tracePayload, traceId: trace.id } };
 }
 
 /**
@@ -220,6 +215,8 @@ async function generateHedgeConditions(
   ctx:   CallContext,
 ): Promise<{
   conditions: string[];
+  predicates: HedgePredicate[];
+  droppedPredicates: number;
   reasoning: string;
   provenance: ProvenanceEntry;
 }> {
@@ -253,7 +250,7 @@ async function generateHedgeConditions(
   const quarantinedIds = quarantined.map((s) => s.id);
   const signalHashes = sent.map((s) => sha256Hex(`${s.promptId}:${s.signalId ?? ''}:${s.source}`).slice(0, 16));
 
-  const { system, user } = hedgeConditionsV1.render({
+  const { system, user } = hedgeConditionsV2.render({
     marketId: input.marketId,
     agentType: input.agentType,
     decisionType: input.decisionType,
@@ -274,15 +271,14 @@ async function generateHedgeConditions(
       `Close if primary signal source reverses direction`,
       `Hard stop-loss at 15% adverse market move`,
     ],
-    reasoning:
-      reason === 'CITATION_REJECTED'
-        ? 'Default hedge conditions applied — LLM output failed citation validation'
-        : 'Default hedge conditions applied — LLM call failed',
+    predicates: [] as HedgePredicate[],
+    droppedPredicates: 0,
+    reasoning: 'Default hedge conditions applied — LLM call failed',
     // No model produced these: marked as such, with no model fields (#66).
     provenance: {
       source: 'default' as const,
-      promptId: hedgeConditionsV1.id,
-      promptVersion: hedgeConditionsV1.version,
+      promptId: hedgeConditionsV2.id,
+      promptVersion: hedgeConditionsV2.version,
       reason,
       ...(citationCheck ? { citationCheck } : {}),
     },
@@ -296,60 +292,21 @@ async function generateHedgeConditions(
         maxTokens: 1024,
         ctx,
         task: 'hedge_conditions',
-        prompt: { id: hedgeConditionsV1.id, version: hedgeConditionsV1.version, hash: hedgeConditionsV1.contentHash },
+        prompt: { id: hedgeConditionsV2.id, version: hedgeConditionsV2.version, hash: hedgeConditionsV2.contentHash },
       },
     );
     const validated = result.value;
-
-    // Output-side citation validation for hedge conditions (#304).
-    const rem = remediateHedgeConditions(validated, sent, quarantinedIds);
-    if (rem.conditions.length < 1) {
+    const grounded = validateAndGroundPredicates(validated.hedge_predicates);
+    if (grounded.droppedCount > 0) {
       logger.warn(
-        { marketId: input.marketId, issueCodes: rem.summary.issueCodes },
-        'CITATION_REJECTED: all hedge conditions failed citation validation — using defaults',
+        { marketId: input.marketId, droppedCount: grounded.droppedCount, droppedReasons: grounded.droppedReasons },
+        'Dropped ungrounded hedge predicates from LLM output',
       );
-      await writeAgentLog({
-        agentType: input.agentType,
-        level: 'WARN',
-        action: 'CITATION_REJECTED',
-        data: {
-          marketId: input.marketId,
-          stage: 'hedge_conditions',
-          checked: rem.summary.checked,
-          issueCodes: rem.summary.issueCodes,
-          signalHashes,
-        },
-      }).catch(() => {});
-      return fallback('CITATION_REJECTED', rem.summary);
     }
-
-    if (rem.action === 'STRIPPED') {
-      logger.info(
-        { marketId: input.marketId, issueCodes: rem.summary.issueCodes, remaining: rem.conditions.length },
-        'CITATION_STRIPPED: stripped invalid hedge conditions',
-      );
-      await writeAgentLog({
-        agentType: input.agentType,
-        level: 'INFO',
-        action: 'CITATION_STRIPPED',
-        data: {
-          marketId: input.marketId,
-          stage: 'hedge_conditions',
-          checked: rem.summary.checked,
-          issueCodes: rem.summary.issueCodes,
-          remaining: rem.conditions.length,
-          signalHashes,
-        },
-      }).catch(() => {});
-    }
-
-    const provenance: LlmProvenance = {
-      ...result.provenance,
-      citationCheck: rem.summary,
-    };
-
     return {
-      conditions: rem.conditions,
+      conditions: validated.hedge_conditions,
+      predicates: grounded.valid,
+      droppedPredicates: grounded.droppedCount,
       reasoning: validated.reasoning_summary,
       provenance,
     };

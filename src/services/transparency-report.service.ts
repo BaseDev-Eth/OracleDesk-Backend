@@ -35,6 +35,12 @@ import {
   type TreasuryAccounting,
 } from './treasury-accounting.service';
 import { pinAndPublishDocument, publishPinnedDocument } from './trace-publish.service';
+import {
+  DEFAULT_METHOD_DOC,
+  createLiveReportChainReader,
+  type ReportChainReader,
+  type ReportContracts,
+} from './report-chain-reader';
 
 dayjs.extend(utc);
 
@@ -288,8 +294,13 @@ export function buildReportDocument(input: ReportInputs): TransparencyReportV2 {
 }
 
 export interface ReportDeps {
+  reader?: ReportChainReader;
+  network?: string;
+  contracts?: ReportContracts;
+  useTraceCache?: boolean;
   now?: () => Date;
   latestLedger?: () => Promise<number>;
+  ledgerClosedAt?: (ledger: number) => Promise<string>;
   marketCount?: () => Promise<bigint>;
   openMarkets?: () => Promise<bigint[] | null>;
   getMarket?: (id: bigint) => Promise<OnChainMarket>;
@@ -299,9 +310,6 @@ export interface ReportDeps {
   dailyUsage?: () => Promise<{ amount: bigint; day_start: bigint }>;
   availableCapital?: () => Promise<bigint>;
   usdcBalance?: (holder: string) => Promise<bigint>;
-  accounting?: () => Promise<TreasuryAccounting>;
-  treasuryContractId?: string;
-  navToleranceRaw?: bigint | string;
   traceCount?: () => Promise<bigint>;
   getTrace?: (id: bigint) => Promise<{ agent: string; action: string }>;
   chainEvents?: (from: Date, to: Date) => Promise<Array<{ contractName: string; eventName: string; ledger: number; ledgerClosedAt: Date; params: unknown }>>;
@@ -332,79 +340,40 @@ function eventParams(event: { params: unknown }): Record<string, unknown> {
   return (event.params ?? {}) as Record<string, unknown>;
 }
 
-export async function buildReportForDate(date: string, deps: ReportDeps = {}): Promise<TransparencyReportV2> {
-  const getLatest =
-    deps.latestLedger ??
-    (async () => (await withTimeout('rpc-read', () => rpcServer.getLatestLedger())).sequence);
-  const count = deps.marketCount ?? marketCount;
-  const readOpenMarkets =
-    deps.openMarkets ??
-    (async () => (await treasuryOpenMarkets()).value);
-  const market = deps.getMarket ?? getOnChainMarket;
-  const position = deps.getPosition ?? getPosition;
-  const readMarketValuation =
-    deps.marketValuation ??
-    (async (id: bigint) => (await treasuryMarketValuation(id)).value);
-  const risk = deps.treasuryConfig ?? treasuryConfig;
-  const usage = deps.dailyUsage ?? treasuryDailyUsage;
-  const available = deps.availableCapital ?? treasuryAvailableCapital;
-  const entries = deps.ledgerEntries ?? treasuryInstanceEntries;
-  const readTraceCount =
-    deps.traceCount ??
-    (async () =>
-      withTimeout('rpc-read', async () =>
-        (await import('./stellar/clients')).readClients.reasoningRegistry().trace_count().then((tx) => tx.result as bigint),
-      ));
-  const getTrace = deps.getTrace ?? (async (id: bigint) => {
-    const { getOnChainTrace } = await import('./chain.service');
-    return getOnChainTrace(id);
-  });
-  const chainEvents = deps.chainEvents ?? (async (from, to) => prisma.chainEvent.findMany({
-    where: { ledgerClosedAt: { gte: from, lte: to } },
-    orderBy: { ledger: 'asc' },
-  }));
-  const indexerCursor = deps.indexerCursor ?? (async () => {
-    const cursor = await prisma.indexerCursor.findFirst({ orderBy: { updatedAt: 'desc' } });
-    return cursor?.lastLedger ?? null;
-  });
-  const previousReport = deps.previousReport ?? (async (d) => {
-    const prev = await prisma.transparencyReport.findFirst({
-      where: { date: { lt: d }, onChainTraceId: { not: null } },
-      orderBy: { date: 'desc' },
-    });
-    return prev ? { onChainTraceId: prev.onChainTraceId, hash: prev.hash } : null;
-  });
+export async function buildReportForDate(date: string, deps: ReportDeps = {}): Promise<TransparencyReportV1> {
+  const reader = deps.reader ?? createLiveReportChainReader();
+  const getLatest = deps.latestLedger ?? (() => reader.latestLedger());
+  const getLedgerClosedAt = deps.ledgerClosedAt ?? (
+    deps.reader
+      ? (ledger: number) => reader.ledgerClosedAt(ledger)
+      : deps.latestLedger
+        ? async () => (deps.now ? deps.now() : new Date()).toISOString()
+        : (ledger: number) => reader.ledgerClosedAt(ledger)
+  );
+  const count = deps.marketCount ?? (() => reader.marketCount());
+  const market = deps.getMarket ?? ((id: bigint) => reader.getMarket(id));
+  const position = deps.getPosition ?? ((id: bigint, holder: string) => reader.getPosition(id, holder));
+  const risk = deps.treasuryConfig ?? (() => reader.treasuryConfig());
+  const usage = deps.dailyUsage ?? (() => reader.dailyUsage());
+  const available = deps.availableCapital ?? (() => reader.availableCapital());
+  const readUsdcBalance = deps.usdcBalance ?? (
+    deps.reader
+      ? (holder: string) => reader.usdcBalance(holder)
+      : deps.availableCapital
+        ? async () => available()
+        : (holder: string) => reader.usdcBalance(holder)
+  );
+  const entries = deps.ledgerEntries ?? (() => reader.ledgerEntries());
+  const readTraceCount = deps.traceCount ?? (() => reader.traceCount());
+  const getTrace = deps.getTrace ?? ((id: bigint) => reader.getTrace(id));
+  const chainEvents = deps.chainEvents ?? ((from: Date, to: Date) => reader.chainEvents(from, to));
+  const indexerCursor = deps.indexerCursor ?? (() => reader.indexerCursor());
+  const previousReport = deps.previousReport ?? ((d: string) => reader.previousReport(d));
+  const useTraceCache = deps.useTraceCache ?? (deps.reader ? reader.useTraceCache : !deps.getTrace);
 
-  // Identity fix (#299): the treasury contract (CONTRACTS.treasury) is the
-  // market creator/LP and the trader in agent_buy/agent_sell; RiskConfig.agent
-  // is the signing G-address used only for the report agent field and traces.
-  const treasuryAddress = deps.treasuryContractId ?? CONTRACTS.treasury;
-
-  const [riskCfg, daily, capital, accountingResult, sacUsdcResult] = await Promise.all([
-    risk(),
-    usage(),
-    available(),
-    (deps.accounting ? deps.accounting() : readTreasuryAccounting({ fresh: true })).catch((err) => {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Transparency report: treasury accounting read failed; using fallback chain block',
-      );
-      return null;
-    }),
-    (deps.usdcBalance
-      ? deps.usdcBalance(treasuryAddress)
-      : usdcBalance(treasuryAddress).then((r) => r.value)
-    ).catch((err) => {
-      logger.warn(
-        { err: err instanceof Error ? err.message : String(err) },
-        'Transparency report: USDC SAC balance read failed; falling back to liquid/available capital',
-      );
-      return null;
-    }),
-  ]);
-
-  const agentAddress = (riskCfg as { agent: string }).agent;
-  const usdcBalanceRawBig = sacUsdcResult ?? accountingResult?.liquidRaw ?? capital;
+  const [riskCfg, daily, capital] = await Promise.all([risk(), usage(), available()]);
+  const treasuryAddress = (riskCfg as { agent: string }).agent;
+  const usdcBalance = await readUsdcBalance(treasuryAddress);
 
   let consistency: 'exact' | 'best_effort' = 'exact';
   let anchor = 0;
@@ -427,16 +396,10 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
     }
 
     const next: RawMarketSnapshot[] = [];
-    for (const id of candidateIds) {
-      try {
-        const [m, p] = await Promise.all([market(id), position(id, treasuryAddress)]);
-        const held = BigInt(p.yes) > 0n || BigInt(p.no) > 0n;
-        if (m.creator === treasuryAddress || held || openIds !== null) {
-          next.push({ marketId: id, market: m, position: p });
-        }
-      } catch (err) {
-        logger.warn({ err, marketId: id.toString() }, 'Transparency report: market read failed; skipped');
-      }
+    for (let i = 0n; i < total; i++) {
+      const [m, p] = await Promise.all([market(i), position(i, treasuryAddress)]);
+      const held = BigInt(p.yes) > 0n || BigInt(p.no) > 0n;
+      if (m.creator === treasuryAddress || held) next.push({ marketId: i, market: m, position: p });
     }
     const l1 = await getLatest();
     snapshots = next;
@@ -449,6 +412,7 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
     if (attempt === SNAPSHOT_ATTEMPTS) consistency = 'best_effort';
   }
 
+  const anchorClosedAt = await getLedgerClosedAt(anchor);
   const markets = snapshots.map((snapshot) => valueMarket(snapshot, treasuryAddress));
 
   // Per-market floor reconciliation (#299): compare chain market_valuation(id)
@@ -540,50 +504,63 @@ export async function buildReportForDate(date: string, deps: ReportDeps = {}): P
   const gaps: Array<[number, number]> = complete ? [] : [[(cursor ?? fromLedger) + 1, toLedger]];
 
   const totalTraces = Number(await readTraceCount());
-  const byAction: Record<string, number> = {};
+  const byActionUnsorted: Record<string, number> = {};
   let agentTraceTotal = 0;
   for (let i = 0; i < totalTraces; i++) {
-    let cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
-    if (!cached) {
+    let traceAgent = '';
+    let traceAction = '';
+    if (useTraceCache) {
+      let cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+      if (!cached) {
+        const trace = await getTrace(BigInt(i)).catch(() => null);
+        if (trace) {
+          await prisma.registryTraceCache.create({
+            data: {
+              traceId: BigInt(i),
+              agent: (trace as { agent?: string }).agent ?? '',
+              marketId: BigInt((trace as { market_id?: bigint }).market_id ?? 0n),
+              action: (trace as { action?: string }).action ?? '',
+              traceHash: Buffer.from((trace as { trace_hash?: Buffer }).trace_hash ?? Buffer.alloc(0)).toString('hex'),
+              ipfsCid: (trace as { ipfs_cid?: string }).ipfs_cid ?? '',
+              publishedAt: BigInt((trace as { published_at?: bigint }).published_at ?? 0n),
+            },
+          }).catch(() => undefined);
+          cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+        }
+      }
+      if (cached) {
+        traceAgent = cached.agent;
+        traceAction = cached.action;
+      }
+    } else {
       const trace = await getTrace(BigInt(i)).catch(() => null);
       if (trace) {
-        await prisma.registryTraceCache.create({
-          data: {
-            traceId: BigInt(i),
-            agent: (trace as { agent?: string }).agent ?? '',
-            marketId: BigInt((trace as { market_id?: bigint }).market_id ?? 0n),
-            action: (trace as { action?: string }).action ?? '',
-            traceHash: Buffer.from((trace as { trace_hash?: Buffer }).trace_hash ?? Buffer.alloc(0)).toString('hex'),
-            ipfsCid: (trace as { ipfs_cid?: string }).ipfs_cid ?? '',
-            publishedAt: BigInt((trace as { published_at?: bigint }).published_at ?? 0n),
-          },
-        }).catch(() => undefined);
-        cached = await prisma.registryTraceCache.findUnique({ where: { traceId: BigInt(i) } }).catch(() => null);
+        traceAgent = trace.agent ?? '';
+        traceAction = trace.action ?? '';
       }
     }
-    if (cached && cached.agent === agentAddress) {
+    if (traceAgent === treasuryAddress) {
       agentTraceTotal++;
-      byAction[cached.action] = (byAction[cached.action] ?? 0) + 1;
+      byActionUnsorted[traceAction] = (byActionUnsorted[traceAction] ?? 0) + 1;
     }
+  }
+  const byAction: Record<string, number> = {};
+  for (const key of Object.keys(byActionUnsorted).sort()) {
+    byAction[key] = byActionUnsorted[key];
   }
 
   const previousRow = await previousReport(date);
-  const methodDoc = deps.methodDoc ?? process.env.REPORT_METHOD_DOC ?? 'https://github.com/OracleDesk/oracledesk-backend/blob/main/docs/transparency-reports.md';
+  const methodDoc = deps.methodDoc ?? reader.methodDoc ?? DEFAULT_METHOD_DOC;
 
   return buildReportDocument({
     date,
-    network: config.STELLAR_NETWORK_PASSPHRASE,
-    contracts: {
-      treasury: treasuryAddress,
-      marketCore: CONTRACTS.marketCore,
-      usdc: CONTRACTS.usdc,
-      reasoningRegistry: CONTRACTS.reasoningRegistry,
-    },
-    agent: agentAddress,
-    anchor: { ledger: anchor, closedAt: (deps.now ? deps.now() : new Date()).toISOString() },
+    network: deps.network ?? reader.network,
+    contracts: deps.contracts ?? reader.contracts,
+    agent: treasuryAddress,
+    anchor: { ledger: anchor, closedAt: anchorClosedAt },
     consistency,
     treasury: {
-      usdcBalanceRaw: usdcBalanceRawBig.toString(),
+      usdcBalanceRaw: usdcBalance.toString(),
       availableCapitalRaw: capital.toString(),
       riskConfig: {
         maxTradeRaw: BigInt((riskCfg as { max_trade: bigint }).max_trade).toString(),

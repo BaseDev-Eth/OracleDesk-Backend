@@ -20,6 +20,7 @@ import {
 import {
   CLAIM_LOCKED_TIMEOUT_MS,
   DAILY_PASS_PRICE_RAW,
+  floatMirror,
   paymentClaimLockKey,
   preauthorizeSpending,
   settleVerifiedTransfer,
@@ -141,7 +142,7 @@ async function recordUnappliedPayment(
       userId: intent.userId,
       txHash: transfer.txHash.toLowerCase(),
       type: PaymentEventType.DAILY_PASS,
-      amount: toDisplayUsdc(transfer.amount),
+      ...floatMirror({ amount: toDisplayUsdc(transfer.amount) }),
       amountRaw: transfer.amount.toString(),
       fromAddress: transfer.from,
       currency: SettlementCurrency.USDC,

@@ -68,7 +68,7 @@
             "string",
             "null"
           ],
-          "pattern": "^\\d+$"
+          "pattern": "^[0-9]+$"
         }
       }
     },

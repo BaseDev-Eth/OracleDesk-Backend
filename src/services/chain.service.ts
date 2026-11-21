@@ -24,6 +24,9 @@ import { logger } from '../lib/logger';
 import { agentClients, agentSigner, readClients, rpcServer } from './stellar/clients';
 import { ChainError, ChainPendingError, TransactionError, contractErrorName, ArchivedEntryError } from './stellar/errors';
 import {
+  beginWriteIntentForRow,
+  endWriteIntentForRow,
+  onConfirmed,
   parseReturnValue,
   prismaOutboxStore,
   runCompletionHandler,
@@ -44,11 +47,11 @@ import type { Category, Config as MarketCoreConfig, Market as OnChainMarket, Out
 import type { Trace } from '../generated/reasoning-registry';
 import type { DailyUsage, RiskConfig } from '../generated/treasury';
 import type { PriceConfig, ResolutionState, SignerConfig } from '../generated/resolver';
-import { getRedis } from '../lib/redis';
 import {
   chainKey,
+  getChainCache,
   memoryChainCache,
-  redisChainCache,
+  setChainCache,
   type ChainCache,
   type CacheEntry,
 } from '../lib/chain-cache';
@@ -61,7 +64,7 @@ import {
   type AgentScope,
 } from './agent-controls.service';
 
-export { memoryChainCache };
+export { getChainCache, memoryChainCache, setChainCache };
 
 import { Account, Address, Contract, Keypair, TransactionBuilder, scValToNative, xdr } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma';
@@ -114,24 +117,26 @@ export const Outcomes = {
   No: { tag: 'No', values: undefined } as Outcome,
 };
 
+// ─── Crash injection (test only) ─────────────────────────────────────────────
+// The outbox crash matrix (tests/integration/outbox-recovery.int.test.ts) stops
+// the live write at each named point. A hook that never settles freezes the
+// write there without running any catch/finally, as a real process death
+// would. Inert unless NODE_ENV=test.
+
+export type CrashPoint = 'after-built' | 'after-signed' | 'after-send-accepted' | 'after-send-timeout' | 'after-advance';
+
+let crashHook: ((p: CrashPoint) => Promise<void>) | null = null;
+
+export function setCrashHookForTest(fn: typeof crashHook): void {
+  if (config.NODE_ENV !== 'test') throw new Error('setCrashHookForTest is test only');
+  crashHook = fn;
+}
+
+async function crashPoint(p: CrashPoint): Promise<void> {
+  if (crashHook && config.NODE_ENV === 'test') await crashHook(p);
+}
+
 // ─── Cache Management ───────────────────────────────────────────────────────
-
-let activeChainCache: ChainCache | null = null;
-
-export function getChainCache(): ChainCache {
-  if (!activeChainCache) {
-    try {
-      activeChainCache = redisChainCache(getRedis());
-    } catch {
-      activeChainCache = memoryChainCache();
-    }
-  }
-  return activeChainCache;
-}
-
-export function setChainCache(cache: ChainCache | null): void {
-  activeChainCache = cache;
-}
 
 export function chainCacheStats() {
   return getChainCache().stats();
@@ -269,21 +274,19 @@ async function write<T>(
   signal?: AbortSignal,
   ref?: WriteRef,
 ): Promise<WriteResult<T>> {
-  return withCallerClass('critical', async () => {
-    const seenVersion = await assertAgentActive(scope);
-    try {
-      const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
-      const result = viaAgentAccount
-        ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
-        : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
-      await recordChainWriteOutcome(scope, true, null);
-      return result;
-    } catch (err) {
-      // A refused write never reached the chain; it is not a chain failure.
-      if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
-        await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null);
-      }
-      throw err;
+  const seenVersion = await assertAgentActive(scope);
+  try {
+    const viaAgentAccount = config.CHAIN_EXECUTION_MODE === 'live' && getChannelPool().size === 0;
+    const result = viaAgentAccount
+      ? await liveWriteWithRetry<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref)
+      : await submitWrite<T>(scope, seenVersion, opClass, contract, method, args, call, signal, ref);
+    await recordChainWriteOutcome(scope, true, null);
+    return result;
+  } catch (err) {
+    // A refused write never reached the chain; it is not a chain failure.
+    if (!(err instanceof AgentPausedError) && (err as { name?: string } | null)?.name !== 'TradeBoundError') {
+      const errDetail = err instanceof Error ? `${err.message} ${String((err as { details?: unknown }).details ?? '')}` : String(err);
+      await recordChainWriteOutcome(scope, false, err instanceof ChainError ? err.contractError : null, errDetail);
     }
   });
 }
@@ -471,6 +474,10 @@ async function submitWrite<T>(
     if (signedRow) outboxRow = signedRow;
   }
 
+  // Register a write intent so concurrent cached readers bypass the cache
+  // while this write is in flight (#330).
+  await beginWriteIntentForRow(outboxRow.id, method, args);
+
   const sender = getTransactionSender();
   const reader = getTransactionReader();
 
@@ -495,6 +502,7 @@ async function submitWrite<T>(
         'CHAIN_SUBMISSION_TIMEOUT',
       );
     }
+    await endWriteIntentForRow(outboxRow.id);
     throw new ChainError(`${method} submission failed`, contractErrorName(contract, err), {
       method,
       cause: err instanceof Error ? err.message : String(err),
@@ -669,6 +677,7 @@ async function attemptWrite<T>(
           innerFee: inclusionFee.toString(),
           resourceFee: minResourceFee.toString(),
         });
+        await crashPoint('after-built');
 
         // The binding built and simulated against the RPC's account; rewrite the
         // built transaction with the sequence allocated from the cached counter.
@@ -700,6 +709,11 @@ async function attemptWrite<T>(
           sequence: rawTx?.built?.sequence != null ? String(rawTx.built.sequence) : null,
         });
         if (signedRow) outboxRow = signedRow;
+        await crashPoint('after-signed');
+
+        // Register a write intent so concurrent cached readers bypass the cache
+        // while this write is in flight (#330).
+        await beginWriteIntentForRow(outboxRow.id, method, args);
 
         const sender = getTransactionSender();
         try {
@@ -716,8 +730,10 @@ async function attemptWrite<T>(
             { signal },
           );
           outboxRow = await acceptSend(store, outboxRow, contract, txHash, sendRes);
+          await crashPoint('after-send-accepted');
           // The network accepted the envelope: reserve the sequence.
           await ctx.advanceSequence();
+          await crashPoint('after-advance');
           return { tx, simulated, txHash, sendRes, maxTime, minTime, minResourceFee };
         } catch (err: any) {
           if (err instanceof SequenceLockLost) {
@@ -729,6 +745,7 @@ async function attemptWrite<T>(
             );
           }
           if (err instanceof TimeoutError || err?.code === 'UPSTREAM_TIMEOUT') {
+            await crashPoint('after-send-timeout');
             // The submission may have been applied: re-read and never rebuild it.
             await ctx.resync().catch(() => undefined);
             throw new ChainWriteFailure(
@@ -799,6 +816,7 @@ async function attemptWrite<T>(
           handledAt: new Date(),
         })
         .catch(() => undefined);
+      await endWriteIntentForRow((outboxRow as ChainTransactionRow).id);
     }
     throw err;
   }
@@ -829,6 +847,7 @@ async function acceptSend(
         handledAt: new Date(),
       })
       .catch(() => undefined);
+    await endWriteIntentForRow(row.id);
     throw new ChainWriteFailure(
       { ...failure, txHash: failure.txHash ?? txHash },
       new Error(`sendTransaction returned ERROR (${failure.txCode ?? failure.class})`),
@@ -963,6 +982,7 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
             handledAt: new Date(),
           })
           .catch(() => undefined);
+        await endWriteIntentForRow(outboxRow.id);
         throw new ExpiredError(`Transaction ${finalHash} expired without inclusion`, attemptId, finalHash);
       }
 
@@ -995,15 +1015,22 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   if (decision === 'FAILED') {
     await submissionRecord('FAILED');
     const errName = contractErrorName(contract, confirmedTx);
+    const failedLedger = (confirmedTx as any)?.ledger ?? null;
     // The live caller's error path stands in for the completion handler.
-    await store
+    const failedRow = await store
       .transition(outboxRow.id, ['SUBMITTED'], 'FAILED', {
         landedHash: finalHash,
-        ledger: (confirmedTx as any)?.ledger ?? null,
+        ledger: failedLedger,
         error: errName ?? 'failed on-chain',
         handledAt: new Date(),
       })
-      .catch(() => undefined);
+      .catch(() => null);
+    await onConfirmed(failedRow ?? { ...outboxRow, landedHash: finalHash, ledger: failedLedger }, {
+      status: 'FAILED',
+      txHash: finalHash,
+      ledger: failedLedger,
+      error: errName ?? 'failed on-chain',
+    });
     throw new ChainError(`${method} failed on-chain: ${errName ?? 'Unknown error'}`, errName, { method, txHash: finalHash });
   }
 
@@ -1033,34 +1060,34 @@ async function confirmSubmitted<T>(c: ConfirmInput<T>): Promise<WriteResult<T>> 
   const chainValue = parseReturnValue({ contract, method }, (confirmedTx as any)?.returnValue);
   const value = (chainValue ?? simulatedValueFromSent<T>(contract, method, c.simulated)) as T;
 
+  const confirmedLedger = (confirmedTx as any)?.ledger ?? null;
   const successRow = await store
     .transition(outboxRow.id, ['SUBMITTED', 'PENDING'], 'SUCCESS', {
       landedHash: finalHash,
-      ledger: (confirmedTx as any)?.ledger ?? null,
+      ledger: confirmedLedger,
       returnValue: printable(value) as object,
     })
     .catch(() => null);
   if (successRow) {
     outboxRow = successRow;
-    // The completion handler has run by the time write() resolves, so callers
-    // read success state back instead of writing it (#35). Idempotent: a crash
-    // here is re-run by the recovery worker.
-    await runCompletionHandler(successRow, { status: 'SUCCESS', value, txHash: finalHash }).catch((err) =>
+    // The completion handler + cache invalidation have run by the time write()
+    // resolves (#35, #330). Idempotent: a crash here is re-run by recovery.
+    await runCompletionHandler(successRow, {
+      status: 'SUCCESS',
+      value,
+      txHash: finalHash,
+      ledger: confirmedLedger,
+    }).catch((err) =>
       logger.error({ err, outboxId: successRow.id, kind: successRow.kind }, 'completion handler failed; recovery will retry'),
     );
+  } else {
+    await onConfirmed({ ...outboxRow, landedHash: finalHash, ledger: confirmedLedger }, {
+      status: 'SUCCESS',
+      value,
+      txHash: finalHash,
+      ledger: confirmedLedger,
+    });
   }
-
-  // Write-through cache invalidation after live submission
-  try {
-    const cache = getChainCache();
-    if (method === 'agent_create_market') {
-      cache.invalidateTag('treasury:capital').catch(() => {});
-    } else if (method === 'agent_buy' || method === 'agent_sell') {
-      const mId = args.market_id !== undefined ? String(args.market_id) : null;
-      if (mId) cache.invalidateTag(`market:${mId}`).catch(() => {});
-      cache.invalidateTag('treasury:capital').catch(() => {});
-    }
-  } catch {}
 
   logger.info({ method, txHash: finalHash, outboxId: outboxRow.id }, 'submitted and confirmed');
   return { mode: 'live', method, value, txHash: finalHash, fee: liveFeeDetails, outboxId: outboxRow.id };
@@ -1149,6 +1176,28 @@ const getPositionImpl = (marketId: bigint, holder: string, signal?: AbortSignal)
   read<Position>('marketCore', 'get_position', async () =>
     readClients.marketCore().get_position({ market_id: marketId, holder }), signal,
   );
+
+/**
+ * get_position plus the ledger the simulation ran against, so the money audit
+ * (#222) can line the balance up with indexed events. Throws when the
+ * simulation carries no ledger: an untagged balance cannot be compared safely.
+ */
+const getPositionWithLedgerImpl = async (
+  marketId: bigint,
+  holder: string,
+  signal?: AbortSignal,
+): Promise<{ position: Position; ledger: number }> => {
+  const { value, tx } = await readTx<Position>(
+    'marketCore',
+    'get_position',
+    async () => readClients.marketCore().get_position({ market_id: marketId, holder }),
+    signal,
+  );
+  const raw = (tx.simulation as { latestLedger?: number | string } | undefined)?.latestLedger;
+  const ledger = raw == null ? NaN : Number(raw);
+  if (!Number.isFinite(ledger)) throw new ChainError('get_position simulation returned no ledger', null, { method: 'get_position' });
+  return { position: value, ledger };
+};
 
 export const getOnChainTrace = (traceId: bigint, signal?: AbortSignal) =>
   read<Trace>('reasoningRegistry', 'get_trace', async () => readClients.reasoningRegistry().get_trace({ trace_id: traceId }), signal);
@@ -1526,8 +1575,12 @@ const agentBuyImpl = (
   ref?: WriteRef,
 ) => {
   const resolver = typeof args === 'function' ? args : async () => args;
-  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', { ...(typeof args === 'function' ? {} : args), ...meta }, async (opts, signer) =>
-    agentClients.treasury(signer).agent_buy(await resolver(), opts as any), signal, ref);
+  const trackedArgs: Record<string, unknown> = { ...(typeof args === 'function' ? {} : args), ...meta };
+  return write<bigint>('TRADER', 'trade', 'treasury', 'agent_buy', trackedArgs, async (opts, signer) => {
+    const resolved = await resolver();
+    if (trackedArgs.market_id === undefined) trackedArgs.market_id = resolved.market_id;
+    return agentClients.treasury(signer).agent_buy(resolved, opts as any);
+  }, signal, ref);
 };
 
 const agentSellImpl = (
@@ -1591,6 +1644,7 @@ const finalizeSignersImpl = (marketId: bigint, signal?: AbortSignal) =>
 
 const IMPLS = {
   getPosition: getPositionImpl,
+  getPositionWithLedger: getPositionWithLedgerImpl,
   marketCoreConfig: marketCoreConfigImpl,
   marketCount: marketCountImpl,
   getOnChainMarket: getOnChainMarketImpl,
@@ -1658,6 +1712,7 @@ export const agentSell = overridable('agentSell');
 export const publishTrace = overridable('publishTrace');
 export const marketCoreConfig = overridable('marketCoreConfig');
 export const getPosition = overridable('getPosition');
+export const getPositionWithLedger = overridable('getPositionWithLedger');
 export const registerSignerSpec = overridable('registerSignerSpec');
 export const attest = overridable('attest');
 export const finalizeSigners = overridable('finalizeSigners');
